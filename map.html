@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>광명맵</title>
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#0C9266">
+    <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="광명맵">
+    <!-- 새 버전 배포 시 강제 로그아웃은 js/auth.js의 AUTH_VERSION + authRequire()로 일괄 처리 -->
+    <script type="text/javascript" src="https://dapi.kakao.com/v2/maps/sdk.js?appkey=2eae4b699110525f0dc62295ed8ed43d&autoload=false"></script>
+    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+    <link rel="stylesheet" href="css/common.css?v=20261030a">
+    <link rel="stylesheet" href="css/marker.css?v=20261030a">
+    <link rel="stylesheet" href="css/panel.css?v=20261030a">
+</head>
+<body>
+    <div id="map"></div>
+
+    <div id="toast" class="toast">복사했습니다</div>
+    <!-- 동기화 진행 표시 — 초기 전체 수신일 때만 뜬다 -->
+    <div id="sync-pill" class="sync-pill"></div>
+    <button class="loc-btn" id="loc-btn" onclick="toggleLocation()">◎</button>
+
+    <!-- 좌상단 메뉴 트리거 버튼 -->
+    <button class="menu-trigger" id="menu-trigger" aria-label="메뉴">
+        <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="3" y1="6" x2="21" y2="6"/>
+            <line x1="3" y1="12" x2="21" y2="12"/>
+            <line x1="3" y1="18" x2="21" y2="18"/>
+        </svg>
+    </button>
+
+    <!-- 우상단 검색 버튼 (메뉴 밖 독립) -->
+    <button class="search-trigger" id="search-trigger" aria-label="검색" onclick="openSearch()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="7"/>
+            <line x1="16.5" y1="16.5" x2="22" y2="22"/>
+        </svg>
+    </button>
+
+    <!-- 앱 메뉴 오버레이 + 패널 -->
+    <div class="app-menu-overlay" id="app-menu-overlay"></div>
+    <div class="app-menu" id="app-menu">
+
+        <!-- 헤더: 사용자 이름 + 닫기 -->
+        <div class="am-header">
+            <span class="am-name" id="user-name-display"></span>
+            <button class="am-x" id="am-close" aria-label="닫기">×</button>
+        </div>
+        <div class="am-sep"></div>
+
+        <!-- 지사 선택 -->
+        <div class="am-section-label">지사</div>
+        <div class="jisa-filter">
+            <select id="jisa-select" onchange="onJisaChange()">
+            </select>
+            <div id="gu-checkboxes" class="gu-filter"></div>
+        </div>
+
+        <div class="am-sep"></div>
+
+        <!-- 리스트 선택 -->
+        <div class="am-section-label">리스트</div>
+        <div class="category-filter" id="category-filter">
+            <button class="category-toggle" id="category-toggle">리스트 &#9662;</button>
+            <div class="category-panel" id="category-panel">
+                <!-- JS에서 DATASETS 기반으로 동적 생성 -->
+            </div>
+        </div>
+
+        <div class="am-sep"></div>
+
+        <!-- 새로고침 — 버튼 하나로 합쳤다(영준님 2026-09-21
+             "새로고침과 작업상태 다시받기는 같은 작용이야 두 개나 있을 필요가 없어").
+             ★합친 쪽은 **전체 재동기화**다. 이 버튼의 존재 이유가 '어긋난 상태를 고치는 것'인데
+               델타만 받으면 어긋남이 그대로 남는다(옛 새로고침은 location.reload() 였다).
+             ★확인 대화상자는 뺐다 — forceFullResync 는 **로컬 캐시만** 비우고
+               미전송 이벤트 큐(localStorage)는 건드리지 않는다(js/firebase.js 주석 참조).
+               되돌릴 수 없는 동작이 아니라 한 번 더 묻는 값어치가 없다. -->
+        <button class="am-row" id="refresh-btn" type="button" onclick="location.reload()">
+            <span class="am-ico">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+            </span>
+            <span class="am-txt">새로고침</span>
+        </button>
+
+        <!-- 공지 — 내용은 data/notices.json (다음 공지부터 그 파일만 고친다). 안 읽은 공지가 있으면 점 표시 -->
+        <button class="am-row" id="notice-btn" type="button" onclick="openNotices()">
+            <span class="am-ico">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3" width="16" height="18" rx="2"/><line x1="8" y1="8" x2="16" y2="8"/><line x1="8" y1="12" x2="16" y2="12"/><line x1="8" y1="16" x2="13" y2="16"/></svg>
+            </span>
+            <span class="am-txt">공지</span>
+            <span class="notice-dot" id="notice-dot-row" style="display:none;width:8px;height:8px;border-radius:50%;background:#ef4444;flex-shrink:0;"></span>
+        </button>
+
+        <div class="am-sep"></div>
+
+        <!-- divider span 보존 (JS가 getElementById로 style.display 제어함 — DOM에 반드시 존재해야 함) -->
+        <span id="admin-divider" style="display:none;"></span>
+        <span id="stats-divider" style="display:none;"></span>
+
+        <div class="am-sep"></div>
+
+        <!-- 로그아웃 -->
+        <button class="am-row am-logout" onclick="authLogout()" type="button">
+            <span class="am-ico">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M15 17l5-5-5-5"/>
+                    <path d="M20 12H9"/>
+                    <path d="M9 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3"/>
+                </svg>
+            </span>
+            <span class="am-txt">로그아웃</span>
+        </button>
+
+        <div style="padding:8px 16px 12px;text-align:right;font-size:10px;color:#888;opacity:0.6;letter-spacing:0.03em;">광명맵 v20261030.1</div>
+    </div>
+
+    <!-- 검색 모달 -->
+    <div id="search-overlay" class="search-overlay" onclick="if(event.target===this)closeSearch()">
+        <div class="search-modal">
+            <div class="search-header">
+                <h3>검색</h3>
+                <button class="close-btn" onclick="closeSearch()">×</button>
+            </div>
+            <div class="search-input-row">
+                <input type="text" id="search-input" placeholder="주소 또는 계기번호 검색" autocomplete="off" onkeydown="if(event.key==='Enter')runSearch()">
+                <button class="search-go-btn" onclick="runSearch()">검색</button>
+            </div>
+            <div class="search-hint" id="search-hint">4자 이상 입력하세요</div>
+            <div class="search-results" id="search-results"></div>
+        </div>
+    </div>
+
+    <div id="fullpage-overlay" class="fullpage-overlay">
+        <!-- 상태 색상 바 (기능 3): pending이면 투명, 나머지는 상태별 색상 -->
+        <div id="status-bar" class="status-bar"></div>
+        <div class="overlay-header">
+            <div class="overlay-address">
+                <h3 id="detail-address"></h3>
+                <p id="detail-road-address"></p>
+            </div>
+            <div class="header-buttons">
+                <button class="close-btn" onclick="closeDetail()">×</button>
+            </div>
+        </div>
+        <!-- 길찾기 — 주소 아래 한 줄, 티맵·네이버·카카오 글자 마크 -->
+        <div class="nav-row">
+            <span class="nav-row-label">길찾기</span>
+            <button class="nav-btn nav-t" id="tmap-btn" aria-label="티맵 길찾기" title="티맵"><span class="nav-mark">T</span></button>
+            <button class="nav-btn nav-n" id="naver-btn" aria-label="네이버 길찾기" title="네이버 지도"><span class="nav-mark">N</span></button>
+            <button class="nav-btn nav-k" id="kakao-btn" aria-label="카카오 길찾기" title="카카오맵"><span class="nav-mark">K</span></button>
+        </div>
+        <!-- 작업자 정보 (기능 4): 지도앱 버튼 아래, pending이거나 정보 없으면 숨김 -->
+        <div id="worker-info" class="worker-info" style="display:none;"></div>
+        <div class="overlay-actions">
+            <div class="action-btn-row">
+                <button class="action-btn complete" id="btn-complete">완료</button>
+                <button class="action-btn hold" id="btn-hold">보류</button>
+                <button class="action-btn fail" id="btn-fail">불가</button>
+                <a id="admin-upload-btn" href="admin.html" style="display:none;padding:10px 12px;background:#1e3a8a;color:white;border-radius:8px;font-size:13px;font-weight:700;text-decoration:none;white-space:nowrap;">사진등록</a>
+                <button id="awms-collect-btn" style="display:none;padding:10px 12px;background:#7c3aed;color:white;border:none;border-radius:8px;font-size:13px;font-weight:700;white-space:nowrap;">큐 보내기</button>
+            </div>
+            <div class="fail-reason-row">
+                <input type="text" class="fail-reason" id="fail-reason" placeholder="불가 사유">
+            </div>
+            <div class="search-row">
+                <input type="text" inputmode="numeric" class="meter-search" id="meter-search" placeholder="계기 검색 (숫자 2자리 이상)">
+                <button class="search-reset-btn" id="meter-search-reset" onclick="document.getElementById('meter-search').value='';renderMetersList();">✕</button>
+            </div>
+        </div>
+        <div id="rework-notice" class="rework-notice" style="display:none;"></div>
+        <div id="common-pole" class="common-pole" style="display:none;"></div>
+        <!-- 계기 리스트 정렬 버튼 바 -->
+        <div class="meter-sort-bar" id="meter-sort-bar">
+            <button class="sort-btn" id="sort-btn-dup" onclick="toggleSort('dup')">중복 정렬</button>
+            <button class="sort-btn" id="sort-btn-maker" onclick="toggleSort('maker')">제조사 정렬</button>
+            <button class="sort-btn" id="add-meter-btn" onclick="openAddMeterModal()" style="display:none;margin-left:auto;background:#8b5cf6;color:white;border-color:#7c3aed;">+ 계기 추가</button>
+        </div>
+        <div class="overlay-meters" id="meters-list"></div>
+    </div>
+
+    <!-- 계기 추가 모달 (admin 전용) -->
+    <div id="add-meter-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:2500;align-items:center;justify-content:center;padding:16px;">
+        <div style="background:white;border-radius:12px;width:100%;max-width:420px;padding:18px;display:flex;flex-direction:column;gap:12px;">
+            <div style="display:flex;align-items:center;justify-content:space-between;">
+                <h3 style="font-size:16px;font-weight:700;color:#111827;">계기 추가</h3>
+                <button onclick="closeAddMeterModal()" style="width:32px;height:32px;border:none;background:#e5e7eb;border-radius:6px;cursor:pointer;font-size:20px;font-weight:600;color:#374151;">×</button>
+            </div>
+
+            <div style="font-size:12px;color:#6b7280;">현재 주소: <span id="add-meter-addr" style="font-weight:600;color:#111827;"></span></div>
+
+            <div style="display:flex;flex-direction:column;gap:4px;">
+                <label style="font-size:12px;font-weight:600;color:#6b7280;">계기번호 (11자리)</label>
+                <div style="display:flex;gap:6px;">
+                    <input id="add-meter-input" type="text" inputmode="numeric" maxlength="11" placeholder="수기 입력 또는 QR 스캔" style="flex:1;padding:10px 12px;border:2px solid #e5e7eb;border-radius:8px;font-size:14px;font-family:ui-monospace,monospace;">
+                    <button onclick="openAddMeterQr()" style="padding:10px 14px;background:#3b82f6;color:white;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap;">QR</button>
+                </div>
+                <div style="display:flex;gap:4px;margin-top:6px;flex-wrap:wrap;">
+                    <button type="button" class="add-meter-alpha-btn" data-ch="A" style="padding:8px 14px;background:#ede9fe;color:#6d28d9;border:1px solid #c4b5fd;border-radius:6px;font-size:14px;font-weight:700;cursor:pointer;min-width:38px;">A</button>
+                    <button type="button" class="add-meter-alpha-btn" data-ch="B" style="padding:8px 14px;background:#ede9fe;color:#6d28d9;border:1px solid #c4b5fd;border-radius:6px;font-size:14px;font-weight:700;cursor:pointer;min-width:38px;">B</button>
+                    <button type="button" class="add-meter-alpha-btn" data-ch="G" style="padding:8px 14px;background:#ede9fe;color:#6d28d9;border:1px solid #c4b5fd;border-radius:6px;font-size:14px;font-weight:700;cursor:pointer;min-width:38px;">G</button>
+                    <button type="button" class="add-meter-alpha-btn" data-ch="L" style="padding:8px 14px;background:#ede9fe;color:#6d28d9;border:1px solid #c4b5fd;border-radius:6px;font-size:14px;font-weight:700;cursor:pointer;min-width:38px;">L</button>
+                    <button type="button" class="add-meter-alpha-btn" data-ch="BS" style="margin-left:auto;padding:8px 14px;background:#fee2e2;color:#dc2626;border:1px solid #fca5a5;border-radius:6px;font-size:14px;font-weight:700;cursor:pointer;min-width:38px;">⌫</button>
+                </div>
+            </div>
+
+            <div id="add-meter-toast" style="display:none;font-size:12px;color:#dc2626;text-align:center;"></div>
+
+            <div style="display:flex;gap:8px;padding-top:8px;border-top:1px solid #e5e7eb;">
+                <button onclick="closeAddMeterModal()" style="flex:1;padding:12px;border:2px solid #e5e7eb;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer;background:white;color:#6b7280;">취소</button>
+                <button onclick="saveNewMeter()" style="flex:1;padding:12px;border:2px solid #10b981;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer;background:white;color:#10b981;">저장</button>
+            </div>
+        </div>
+    </div>
+
+
+    <!-- QR 라이브 스캔 오버레이 -->
+    <div id="qr-scan-overlay" style="display:none;position:fixed;inset:0;background:black;z-index:3000;flex-direction:column;">
+        <div style="display:flex;align-items:center;padding:10px 14px;background:#111;color:white;gap:8px;">
+            <span id="qr-cam-label" style="font-size:12px;font-weight:600;white-space:nowrap;">카메라</span>
+            <select id="qr-cam-select" style="flex:1;min-width:140px;padding:8px 10px;background:#374151;color:white;border:1.5px solid #6b7280;border-radius:6px;font-size:13px;font-weight:600;appearance:auto;-webkit-appearance:auto;"><option>카메라 로드 중...</option></select>
+            <button id="qr-close-btn" style="padding:6px 12px;background:#ef4444;color:white;border:none;border-radius:6px;font-size:14px;font-weight:700;">×</button>
+        </div>
+        <div style="flex:1;display:flex;align-items:center;justify-content:center;background:black;overflow:hidden;">
+            <div id="qr-reader" style="width:min(100vw, 100%); aspect-ratio:1/1; max-height:100%; background:black; position:relative; overflow:hidden;"></div>
+        </div>
+        <div id="qr-error-msg" style="display:none;padding:14px;background:#7f1d1d;color:white;font-size:13px;text-align:center;"></div>
+        <div style="display:flex;gap:6px;padding:8px;background:#111;">
+            <button id="qr-switch-btn" style="display:none;flex:1;padding:10px;background:#374151;color:white;border:none;border-radius:6px;font-size:14px;font-weight:700;">카메라 전환</button>
+            <button id="qr-zoom-out" style="flex:1;padding:10px;background:#374151;color:white;border:none;border-radius:6px;font-size:14px;font-weight:700;">- 줌</button>
+            <button id="qr-zoom-in" style="flex:1;padding:10px;background:#374151;color:white;border:none;border-radius:6px;font-size:14px;font-weight:700;">+ 줌</button>
+            <button id="qr-torch-btn" style="display:none;flex:1;padding:10px;background:#374151;color:white;border:none;border-radius:6px;font-size:14px;font-weight:700;">손전등</button>
+        </div>
+    </div>
+
+    <script src="js/auth.js?v=20261030a"></script>
+    <script>
+        // 로그인 체크 — 미인증이면 login.html로 이동
+        authRequire();
+
+        // 사용자 이름 표시 + 어드민 버튼
+        (function () {
+            const session = authGetSession();
+            if (session) {
+                document.getElementById('user-name-display').textContent = session.name;
+                // 관리자 전용 메뉴(관리자·사진등록·awms수집·계기추가)는 숨김 —
+                // admin도 윤용운(user09)과 동일 UI로 통일 (영준님 지시 2026-07-04).
+                // 통계 = 관리자 + 윤용운(user09, 작업자 총괄)
+                // ★판정은 js/auth.js 의 authAllowsGroup('staff') 하나로 모았다(2026-09-15).
+                //   같은 조합이 stats.html 에도 있어, 흩어져 있으면 계정을 더 열 때 어긋난다.
+                if (authAllowsGroup('staff')) {
+                    document.getElementById('stats-btn').style.display = '';
+                    document.getElementById('stats-divider').style.display = '';
+                }
+            }
+        })();
+    </script>
+    <script src="js/config.js?v=20261030a"></script>
+    <script src="js/utils.js?v=20261030a"></script>
+    <script src="js/status-key.js?v=20261030a"></script>
+    <script src="js/datasets.js?v=20261030a"></script>
+    <script src="js/firebase.js?v=20261030a"></script>
+    <script src="js/awms-parseValue.js?v=20261030a"></script>
+    <script src="js/qr-scanner.js?v=20261030a"></script>
+    <script src="js/recall.js?v=20261030a"></script>
+    <script src="js/detail.js?v=20261030a"></script>
+    <script src="js/idb.js?v=20261030a"></script>
+    <script src="js/view-only.js?v=20261030a"></script>
+    <script src="js/map.js?v=20261030a"></script>
+    <script src="js/app-version.js?v=20261030a"></script>
+    <script src="js/notice.js?v=20261030a"></script>
+    <script>
+        // 앱 메뉴 토글
+        (function () {
+            var trigger = document.getElementById('menu-trigger');
+            var menu = document.getElementById('app-menu');
+            var overlay = document.getElementById('app-menu-overlay');
+            if (!trigger || !menu || !overlay) return;
+
+            function openMenu() {
+                menu.classList.add('open');
+                overlay.classList.add('open');
+            }
+            function closeMenu() {
+                menu.classList.remove('open');
+                overlay.classList.remove('open');
+            }
+
+            // closeAppMenu를 전역으로 노출 (검색 버튼 onclick에서 사용)
+            window.closeAppMenu = closeMenu;
+
+            trigger.onclick = openMenu;
+            overlay.onclick = closeMenu;
+            var closeBtn = document.getElementById('am-close');
+            if (closeBtn) closeBtn.onclick = closeMenu;
+        })();
+    </script>
+</body>
+</html>

@@ -1,0 +1,1622 @@
+// detail.js — 상세 패널(오버레이) 로직
+
+let currentAddress = '';
+let currentMeters = [];
+// 합친 마커(같은 좌표 여러 지번)의 구성 지번 전체. 단일이면 [currentAddress]. — 표시용
+let currentAddresses = [];
+// 이 패널이 읽고 쓰는 workStatus 키. 한 주소가 마커 여러 개로 갈리면 주소와 다르다.
+//   ★workStatus 접근은 반드시 이쪽을 쓴다. currentAddress는 화면 표시 전용.
+let currentStatusKey = '';
+
+// HTML 이스케이프 — Firebase 에서 온 값(작업자 이름·추가계기·사유)은 누구나 쓸 수 있는 경로라
+//   innerHTML 에 넣기 전에 반드시 거친다(2026-10-19 감사: 저장형 스크립트 주입).
+function escHtml(s) {
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+// 계기번호 법칙 — 11자리, 1~2번째만 영문 가능(CLAUDE.md 데이터 규칙)
+const METER_NO_RE = /^[0-9A-Z]{2}[0-9]{9}$/;
+let currentStatusKeys = [];
+
+// 현재 정렬 모드: 'none' | 'dup' | 'maker'
+let currentSortMode = 'none';
+
+// ── 변대주 공통 표시 판정 (큰 글씨 블록) ──────────────────────────────────
+//   ★예전엔 DCUID 만 봤다. 그래서 LTE 개소(DCU 를 안 쓰니 DCUID 가 원본에도 없다)는
+//     블록이 통째로 안 뜨고 **변대주까지 같이 사라졌다**(영준님 지적 2026-08-19,
+//     합동 종로 4마커). 전산화번호가 있으면 DCUID 가 없어도 띄운다.
+//   ※두 값을 함께 비교한다 — 전산화번호만 보면 PLC+K-DCU 가 섞인 마커(명륜3가 1-1054)가
+//     '같다'로 뭉쳐진다. 그 마커는 계기마다 DCU 가 달라 개별 표시로 내려가는 게 맞다.
+//   ※값이 빈 계기가 섞여 있으면(원천에 없는 1건) 공통으로 보지 않는다 — 나머지와 같다는
+//     근거가 없다. 그 마커는 계기별로 각자 찍힌다.
+//   ※전산화번호가 실린 필드 이름이 데이터셋마다 다르다 — 합동 종로는 `변대주전산화`,
+//     25미청구·미청구불가는 `변대주번호` 다. 뜻이 같으니 여기서 하나로 읽는다.
+//     ★데이터 쪽 이름을 바꾸지 않는다(빌더·게이트가 그 이름으로 검사한다).
+function poleNoOf(m) {
+    return (m && (m.변대주전산화 || m.변대주번호)) || '';
+}
+function poleIdOf(m) {
+    return `${poleNoOf(m)}|${(m && m.DCUID) || ''}`;
+}
+function isPoleCommon(meters) {
+    if (!meters || !meters.length) return false;
+    if (!(poleNoOf(meters[0]) || meters[0].DCUID)) return false;
+    return meters.every(m => poleIdOf(m) === poleIdOf(meters[0]));
+}
+
+// ── 변대주 영역 = 'DCU 로 통신하는 곳인가' 를 보여주는 자리 ────────────────────
+//   영준님 2026-09-20: "변대주 필드가 있는 이유 = 이 주소에 들어간 곳이 DCU 로 통신하는
+//   곳인지 아닌지를 보여주는 것". 작업자는 이걸 보고 PLC 계열로 갈지 LTE 로 갈지 정한다.
+//   ★그러니 이 영역의 원천은 **DCU DB(dcu_master) 하나뿐**이다.
+//     변대주명·전산화번호로 대장을 찾고, 찾으면 그 행의 DCU_ID·인입망통신방식·
+//     회선상태·철거판정을 **통째로** 읽는다. 넷 중 하나만 채우는 일이 없다.
+//   ★★대장에 없으면 '결손'이 아니라 **판별 결과**다 — 'DCU 없음' 으로 명시한다.
+//     빈칸으로 두면 '모른다'로 읽힌다. 원장·보강현황의 변대주 값으로 이 줄을 채우지 마라.
+//   ★디테일(원장·현장 기록)과 서로 메우지 않는다. 상단 PLC · 디테일 LTE 가 동시에
+//     맞을 수 있다(실측 1,187건) — 그 변대주엔 PLC DCU 가 달려 있고 우리 계기는 LTE 로
+//     따로 간 것이다. 비교해 한쪽을 고치거나 문구를 띄우지 마라.
+//   ★판단 문구 금지 — 값만 보여주면 작업자가 안다.
+//   세 갈래: 대장 매칭 -> '4차 · PLC · 개통 · 미판정' / 변대주는 있는데 대장에 없음 ->
+//            'DCU 없음' / 변대주 자체가 없음 -> 판별할 근거가 없으니 줄을 안 그린다.
+//   ★DCU ID 는 여기 안 넣는다 — 줄 맨 앞 값이 이미 DCU ID 다(중복).
+//   ★차수는 dcu_master 의 '차수' 열에서 **같은 행으로** 온다(영준님 2026-09-20).
+//     예전엔 DCUID 끝 2자리를 회색으로 떼어 차수처럼 보여줬는데 그건 표기일 뿐 차수가 아니다.
+//   ★**기본 상태값은 숨긴다**(영준님 2026-09-20). 대부분이 기본값이라 찍으면 줄만 길어지고,
+//     정작 봐야 할 값이 묻힌다. 뭔가 뒤에 붙어 있으면 그 자체가 정보다.
+//       회선상태 — '개통'(대장 18,692/19,007) 숨김 / 정지 196 · 해지 119 표시
+//       철거판정 — '미판정'(18,713) 숨김 / 해지 283 · 유지 11 표시
+//     ★값은 대장 표기 그대로 쓴다 — '철거예정' 같은 말로 바꾸지 않는다.
+//     ★판단 문구도 안 붙인다. 숨기는 것은 **화면뿐**이고 데이터에는 전부 남는다.
+//   ※장애여부는 상단에 안 그린다(영준님 정정). 대장에서 읽는 묶음은 다섯이다 —
+//     DCU_ID · 인입망통신방식 · 회선상태 · 철거판정 · 차수.
+function dcuLedgerLine(m) {
+    if (!m || !m.대장출처) return '';            // 대장 조회를 안 거친 리스트엔 이 줄이 없다
+    // ★함수 안에 둔다 — 밖에 두면 검증 하네스(렌더 구간만 떼어 돌린다)가 못 집어 간다.
+    const HIDE = { 회선상태: '개통', 철거판정: '미판정' };
+    const KEYS = ['DCU차수', 'DCU통신방식', '회선상태', '철거판정'];
+    // ★대장 매칭 판정은 **표시 여부와 따로** 한다. 기본값만 있는 개소를 'DCU 없음' 으로
+    //   떨어뜨리면 거짓말이 된다 — 그 개소는 DCU 가 있고 상태가 평범한 것이다.
+    const matched = KEYS.some(k => String(m[k] || '').trim());
+    if (matched) {
+        return KEYS.map(k => String(m[k] || '').trim())
+            .filter((v, i) => v && v !== HIDE[KEYS[i]])
+            .join(' · ');
+    }
+    // ── 대장 미등재. 여기서 **두 경우를 가른다**(영준님 2026-09-20 정정) ─────
+    // ① 우리 리스트에 DCUID 가 실려 있는데 그 변대주가 대장에 없다 -> **아무것도 안 쓴다.**
+    //    원장 DCUID 를 그리지도 않고 'DCU 없음' 글자도 찍지 않는다 —
+    //    대장이 원천인데 대장에 없으니 할 말이 없다.
+    if (String(m.DCUID || '').trim()) return '';
+    // ② 변대주 값은 있는데 대장 조회로 DCU 를 못 찾았다 -> **'DCU 없음'**.
+    //    빈칸이 아니라 판별 결과다 — 그 개소는 DCU 통신이 아니다.
+    if (poleNoOf(m) || m.변대주) return 'DCU 없음';
+    // ③ 변대주 자체가 없다 -> 판별 근거가 없으니 줄을 안 그린다.
+    return '';
+}
+// 대장에 없는 개소에서 화면에 쓸 DCU ID — **없다.**
+//   원장이 DCUID 를 실어 보낸 건이 있지만(25미청구 125건) 대장에 없으면 DCU 개소가
+//   아니라는 판별이므로 그 값을 변대주 줄에 그리지 않는다. 데이터에는 남겨 둔다.
+function poleMeterForDisplay(m) {
+    if (!m || !m.대장출처) return m;
+    const hit = !!(m.DCU차수 || m.DCU통신방식 || m.회선상태 || m.철거판정);
+    if (!hit) return Object.assign({}, m, { DCUID: '' });
+    // ★대장 매칭이면 전산화번호도 **대장 기준**(DCUID 앞 8자리)으로 그린다.
+    //   원장 번호를 그리면 DCU ID 가 화면에서 통째로 가려진다 — poleDisplay 는 번호로
+    //   시작하는 DCUID 일 때만 끝 2자리를 이어 붙이기 때문이다. 원장 번호와 DCUID 앞 8이
+    //   어긋나는 340건이 그래서 'DCU ID 안 보임' 이 됐다(2026-09-20 대조표에서 잡았다).
+    //   상단의 유일 원천은 대장이니 표시도 대장으로 맞춘다. ★데이터는 안 건드린다 —
+    //   원장 번호는 `변대주번호` 에, 대장 파생은 `변대주번호_대안` 에 그대로 있다.
+    const id = String(m.DCUID || '').trim();
+    if (id.length === 10 && poleNoOf(m) && poleNoOf(m).toUpperCase() !== id.slice(0, 8)) {
+        return Object.assign({}, m, { 변대주전산화: id.slice(0, 8), 변대주번호: id.slice(0, 8) });
+    }
+    return m;
+}
+
+// 변대주 한 줄의 HTML — { html, copyVal }.
+//   ★새 형식(전산화번호 + 괄호 전주명)은 **변대주전산화 필드가 있을 때만** 쓴다.
+//     실효·재방문·고압은 그 필드가 없다(site-data 10,404건 전부). 그 경우 예전 그대로 그린다.
+//     종로맵(jongno-combined/js/detail.js)과 형식·복사값을 맞춘 것이다.
+function poleDisplay(m, iconSvg, btnStyle) {
+    const poleNo = poleNoOf(m);
+    const dcu = (m && m.DCUID) || '';
+    let valHtml, copyVal;
+    if (poleNo) {
+        // DCU 차수(끝 2자리)는 전산화번호에 이어 붙은 형태일 때만 회색으로 뗀다. LTE 는 없다.
+        const tail = (dcu && dcu.indexOf(poleNo) === 0 && dcu.length === poleNo.length + 2)
+            ? `<span class="seg-dup">${dcu.slice(-2)}</span>` : '';
+        valHtml = `<span>${poleNo}</span>${tail}`;
+        copyVal = poleNo;
+    } else if (/[A-Za-z]/.test(dcu)) {
+        const dcuMain = dcu.slice(0, -2);
+        valHtml = `<span>${dcuMain}</span><span class="seg-dup">${dcu.slice(-2)}</span>`;
+        copyVal = dcuMain;
+    } else {
+        valHtml = `<span>${dcu}</span>`;
+        copyVal = dcu;
+    }
+    // 괄호 안 전주명 — 종로맵과 같은 보조 표기(흐리게). 전산화번호가 있을 때만 붙인다.
+    const nameHtml = (poleNo && m.변대주)
+        ? ` <span style="opacity:0.7;font-weight:normal;">(${m.변대주})</span>` : '';
+    const btn = `<button class="copy-btn pole-copy-btn" data-copy="${copyVal}" title="변대주 전산화번호 복사" style="${btnStyle}">${iconSvg}</button>`;
+    return { html: `${valHtml}${nameHtml}${btn}`, copyVal };
+}
+
+// ── LP 수신 이력 한 줄 요약 (SKT 중계기) ──────────────────────────────────
+//   영준님 지시 2026-08-21 "디테일에 표로 넣지 말고 그냥 말로."
+//   회차 x LP1/LP2 표를 그렸다가 걷어냈다 — 지도에 올린 41건은 전부 미작업이라 표가
+//   사실상 빈칸이었다(38건은 7회 전부 빈값). 내용이 있는 건 3건뿐인데 7행짜리 표를
+//   41건 전부에 그리고 폰에서 가로 스크롤까지 붙일 값어치가 없었다.
+//   ★데이터(lp_이력)는 그대로 둔다. 완료건이 들어오거나 회차가 쌓이면 다시 쓸 수 있다.
+//
+//   판정은 회차마다 **LP1·LP2 중 좋은 쪽**으로 본다 — 한쪽만 값이 있는 개소가 많아
+//   하나만 보면 오판한다. ★'9/24'·'36/96' 은 정상이다(24개 중 9개라 미달로 보이지만
+//   한전이 정상으로 판정한 실증이 있다). 실패는 '0/24' 뿐이다.
+//   -> { text, bad } 를 돌려준다. bad(0수신)일 때만 빨강으로 그린다.
+/** 미청구 LP 7일치 — **표시할 때만** 바꿔 보여준다(영준님 2026-09-20).
+ *
+ * ★저장값은 건드리지 않는다. 1·0·소수·'#N/A' 를 그대로 들고 있어야 나중에 재판정이 된다.
+ *   화면에서만 1 -> 100% · 0 -> 0% · 0.9583333 -> 95.8% · '#N/A' -> n/a.
+ * ★'n/a' 와 '0%' 는 **뜻이 다르다** — 0 은 무수신이고 n/a 는 조회 자체가 안 된 것이다.
+ *   보기 좋다고 둘을 같은 표기로 합치지 마라.
+ * ★뭉개지 마라 — 추이가 정보다. 6월 0 인데 9월 100% 면 그사이 해결된 것이고,
+ *   9월 중 100% -> 0% 로 꺾이면 최근에 끊긴 것이다.
+ * 날짜는 앞 0 을 떼고 '/' 로 통일한다: 'LP 06/10' -> '6/10' · 'LP 09-05' -> '9/5'.
+ */
+function michungguLpCells(meter) {
+    const lp = meter && meter.LP;
+    if (!lp || typeof lp !== 'object') return null;
+    const keys = Object.keys(lp);
+    if (!keys.length) return null;
+    const pct = (v) => {
+        const s = String(v == null ? '' : v).trim();
+        if (!s) return '';
+        if (s === '#N/A') return 'n/a';
+        const n = Number(s);
+        if (!isFinite(n)) return s;                 // 뜻 모를 값은 원문 그대로 보여준다
+        const p = n * 100;
+        // 소수점 한 자리면 충분하다. 100.0%·0.0% 는 정수로 떨어뜨린다
+        return (Math.round(p * 10) % 10 === 0 ? String(Math.round(p)) : p.toFixed(1)) + '%';
+    };
+    // 'LP 06/10' · 'LP 09-05' -> '6/10' · '9/5'. 형태가 다르면 원문 그대로 둔다.
+    const day = (k) => {
+        const s = String(k).replace(/^LP\s*/, '').trim();
+        const mm = s.match(/^(\d{1,2})[/\-.](\d{1,2})$/);
+        return mm ? `${Number(mm[1])}/${Number(mm[2])}` : s;
+    };
+    const cells = keys.map(k => ({ day: day(k), val: pct(String(lp[k] == null ? '' : lp[k]).trim()) }));
+    // 전 회차가 빈칸이면 표 자체를 그리지 않는다 — 빈 표는 자리만 먹는다.
+    return cells.some(c => c.val) ? cells : null;
+}
+
+/** 미청구 LP 표 (영준님 2026-09-22 "디테일에 엘피를 표로 만들어줘").
+ *
+ * 전에는 한 줄 문장이었다 — `LP 6/10~9/7 n/a · 9/8 39.6% · 9/9~9/13 100%`.
+ *   같은 값을 묶어 줄을 줄였는데, 회차가 7 개로 늘자 다른 필드와 뒤섞여 어느 날 값인지
+ *   읽기 어려웠다. 표는 칸이 날짜에 1:1 로 대응하므로 **묶지 않고 전부 편다** —
+ *   묶으면 표에서는 오히려 날짜 대응이 깨진다.
+ * ★판단 유도 금지(영준님 2026-09-20) — 0% 를 빨강으로 칠하거나 경고를 붙이지 않는다.
+ *   값만 보여주면 작업자가 읽는다. 회색은 'n/a(조회 실패)' 와 값의 구분일 뿐이다.
+ * ★값이 빈 회차도 날짜 칸은 남긴다 — 자리를 비워 둬야 추이가 끊긴 지점이 보인다.
+ * ★가로 스크롤은 표 안에서만 일어난다(.lp-table-wrap). 폰에서 패널 전체가 밀리면 안 된다.
+ */
+function michungguLpTable(meter) {
+    const cells = michungguLpCells(meter);
+    if (!cells) return '';
+    const head = cells.map(c => `<th>${c.day}</th>`).join('');
+    const body = cells.map(c => {
+        const na = c.val === 'n/a';
+        return `<td${na ? ' class="lp-na"' : ''}>${c.val || ''}</td>`;
+    }).join('');
+    return `<div class="lp-table-wrap"><table class="lp-table">` +
+        `<tr><th class="lp-corner">LP</th>${head}</tr>` +
+        `<tr><td class="lp-corner"></td>${body}</tr>` +
+        `</table></div>`;
+}
+
+
+function lpSummary(meter) {
+    const rows = meter && meter.lp_이력;
+    if (!Array.isArray(rows) || !rows.length) return null;
+
+    // '260612' -> '06/12'. 원본 표기를 그대로 내보내지 않는다.
+    const label = (v) => {
+        const s = String(v || '');
+        return s.length === 6 ? `${s.slice(2, 4)}/${s.slice(4)}` : s;
+    };
+
+    const verdict = rows.map(r => {
+        const vals = [r.lp1, r.lp2].map(v => String(v == null ? '' : v).trim()).filter(Boolean);
+        if (!vals.length) return { state: '수신없음', value: '' };
+        const ok = vals.find(v => v !== '0/24');
+        return ok ? { state: '정상', value: ok } : { state: '0수신', value: '0/24' };
+    });
+
+    // 한 번도 안 붙은 개소 — 그 자체가 정보다(현재 41건 중 38건)
+    if (verdict.every(v => v.state === '수신없음')) return { text: 'LP 수신 이력 없음', bad: false };
+
+    const last = verdict[verdict.length - 1];
+    if (last.state === '정상') {
+        return { text: `LP 정상 ${last.value} (${label(rows[rows.length - 1].회차)})`, bad: false };
+    }
+
+    // 지금 상태가 언제부터 이어지는지 — 같은 판정이 연속된 첫 회차까지 거슬러 올라간다.
+    let i = verdict.length - 1;
+    while (i > 0 && verdict[i - 1].state === last.state) i--;
+    return {
+        text: `LP ${last.state} — ${label(rows[i].회차)}부터 ${verdict.length - i}회 연속`,
+        bad: last.state === '0수신',
+    };
+}
+
+/** 계기 카드를 모뎀 MAC 단위로 묶어 그린다 (영준님 2026-09-22).
+ *
+ * 한 주소에 함체가 둘 이상일 때만 불린다(macGrouped) — 부르는 쪽에서 이미 걸렀다.
+ * ★MAC 이 없는 계기는 **맨 뒤 한 묶음**으로 몬다. 빈 키를 중간에 두면 색 있는 묶음 사이에
+ *   회색 묶음이 끼어 순서가 흐려진다. 불가 리스트처럼 MAC 을 안 싣는 데이터가 여기 온다.
+ * ★묶음 순서는 **처음 나온 순서**다(정렬하지 않는다) — 계기 정렬은 이미 위에서 끝났고
+ *   여기서 다시 정렬하면 작업자가 익힌 순서가 뒤집힌다.
+ * ★색은 묶음을 **구분**하려고 돌려 쓴다. 값의 좋고 나쁨을 뜻하지 않는다(판단 유도 금지).
+ */
+function macGroupsHtml(meters, cards, macKeyOf) {
+    const order = [];
+    const byMac = new Map();
+    meters.forEach((m, i) => {
+        const k = macKeyOf(m);
+        if (!byMac.has(k)) { byMac.set(k, []); order.push(k); }
+        byMac.get(k).push(cards[i]);
+    });
+    const keys = order.filter(Boolean).concat(order.includes('') ? [''] : []);
+    const COPY = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
+    return keys.map((k, gi) => {
+        const items = byMac.get(k);
+        const n = `<span class="mac-group-count">계기 ${items.length}</span>`;
+        const head = k
+            ? `<div class="mac-group-head">MAC <span class="mac-hl mac-g${gi % 6}">${k}</span>` +
+              `<button class="copy-btn" data-copy="${k}" title="모뎀MAC 복사">${COPY}</button>${n}</div>`
+            : `<div class="mac-group-head mac-group-none">모뎀 MAC 없음${n}</div>`;
+        return `<div class="mac-group ${k ? `mac-b${gi % 6}` : 'mac-b-none'}">${head}${items.join('')}</div>`;
+    }).join('');
+}
+
+// 주소 클릭 시 상세 패널 표시
+function showDetail(address, meters, addresses, statusKeys) {
+    currentAddress = address;
+    currentMeters = meters;
+    currentAddresses = (addresses && addresses.length) ? addresses : [address];
+    currentStatusKeys = (statusKeys && statusKeys.length) ? statusKeys : currentAddresses;
+    // 대표 키 — 클릭한 지번에 대응하는 키를 우선 고른다(없으면 첫 키).
+    currentStatusKey = currentStatusKeys.find(k => addressOfStatusKey(k) === address) || currentStatusKeys[0];
+
+    // 어드민 사진등록 버튼에 현재 주소 전달
+    const adminBtn = document.getElementById('admin-upload-btn');
+    if (adminBtn) adminBtn.href = `admin.html?addr=${encodeURIComponent(address)}`;
+
+    // awms수집 버튼 — 이 주소 계기풀을 아미큐 앱으로 연동(handoff write + 딥링크)
+    // 노출은 관리자만 (map.html 초기 isAdmin 블록에서 display 제어). 여기선 동작만 연결.
+    const collectBtn = document.getElementById('awms-collect-btn');
+    if (collectBtn) collectBtn.onclick = () => collectToAmiqueue(address, meters);
+
+    const status = workStatus[currentStatusKey] || { state: 'pending', checkedMeters: [], reason: '' };
+    status.checkedMeters = status.checkedMeters || [];
+
+    // 주소 텍스트 추출 — 더러운 값(undefined/null/"-") 거름
+    const DIRTY_RE = /^\s*(undefined|null|-)(\s+(undefined|null|-))*\s*$/i;
+    const isUsable = (s) => {
+        if (s == null) return false;
+        const t = String(s).trim();
+        return !!t && !DIRTY_RE.test(t);
+    };
+    const pick = (...vals) => vals.find(isUsable) || '';
+    // 지번 — 합동시공은 원문 주소가 '도로명 4(창동 676-32,1층좌)' 꼴이라 그대로 쓰면 읽기 나쁘다.
+    //   카카오가 확인해 준 지번주소가 있으면 그것을 먼저 쓰고, 없으면 예전대로 원문을 쓴다.
+    //   (다른 데이터셋에는 지번주소 필드가 없어 동작이 그대로다. 동호수는 계기별 상세줄에 나온다.)
+    const jibunAddr = pick(meters[0] && meters[0].지번주소, meters[0] && meters[0].주소, address);
+    const roadAddr  = pick(meters[0] && meters[0].도로명주소);
+
+    // 헤더 = 도로명 우선(있으면), 없으면 지번
+    // 화면에 보이는 텍스트 = data-copy 속성 (계기번호 복사와 동일 패턴)
+    const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const COPY_ICON_SVG = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
+    const headerAddr = roadAddr || jibunAddr;
+    document.getElementById('detail-address').innerHTML =
+        `<span>${esc(headerAddr)}</span>` +
+        `<button class="copy-btn" data-copy="${esc(headerAddr)}" title="주소 복사" style="margin-left:6px;vertical-align:middle;">${COPY_ICON_SVG}</button>`;
+
+    // 좌표정확도가 approximate인 계기가 하나라도 있으면 "주소 오류" 표시
+    const hasApproximate = meters.some(m => m.좌표정확도 === 'approximate');
+    const errorTag = hasApproximate
+        ? ' <span style="color:#ef4444;font-size:12px;">(주소 오류)</span>'
+        : '';
+
+    // 도로명/지번 라인 — 헤더와 다를 때만 노출 (중복 표시 방지)
+    let roadLine = '';
+    if (roadAddr && roadAddr !== headerAddr) {
+        roadLine = `<span class="addr-tag">도로명</span><span>${esc(roadAddr)}</span>` +
+            `<button class="copy-btn" data-copy="${esc(roadAddr)}" title="도로명 복사" style="margin-left:6px;vertical-align:middle;">${COPY_ICON_SVG}</button>` +
+            errorTag;
+    } else if (hasApproximate) {
+        roadLine = errorTag;
+    }
+    let jibunLine = '';
+    if (jibunAddr && jibunAddr !== headerAddr) {
+        const br = roadLine ? '<br>' : '';
+        jibunLine = `${br}<span class="addr-tag">지번</span><span style="color:#9ca3af;">${esc(jibunAddr)}</span>` +
+            `<button class="copy-btn" data-copy="${esc(jibunAddr)}" title="지번 복사" style="margin-left:6px;vertical-align:middle;">${COPY_ICON_SVG}</button>`;
+    }
+    document.getElementById('detail-road-address').innerHTML = roadLine + jibunLine;
+
+    // 주소 복사 핸들러 — copy-btn 클래스 + data-copy 속성 (계기번호와 동일 패턴)
+    document.querySelectorAll('#detail-address .copy-btn, #detail-road-address .copy-btn').forEach(btn => {
+        btn.onclick = (e) => {
+            e.stopPropagation();
+            const v = btn.dataset.copy;
+            if (v) copyMeterNo(v);
+        };
+    });
+
+    // 상태 색상 바 업데이트 (기능 3)
+    updateStatusBar(status.state);
+
+    // 지도 앱 버튼 3개 — 도로명주소로 검색
+    document.getElementById('tmap-btn').onclick = () => {
+        window.location.href = `tmap://search?name=${encodeURIComponent(roadAddr)}`;
+    };
+    document.getElementById('naver-btn').onclick = () => {
+        window.location.href = `nmap://search?query=${encodeURIComponent(roadAddr)}`;
+    };
+    document.getElementById('kakao-btn').onclick = () => {
+        window.location.href = `kakaomap://search?q=${encodeURIComponent(roadAddr)}`;
+    };
+
+    const btnComplete = document.getElementById('btn-complete');
+    const btnHold = document.getElementById('btn-hold');
+    const btnFail = document.getElementById('btn-fail');
+
+    // 완료 상태면 초기화 버튼으로 전환
+    if (status.state === 'complete') {
+        btnComplete.textContent = '초기화';
+        btnComplete.className = 'action-btn reset';
+        btnComplete.onclick = () => resetStatus();
+    } else {
+        btnComplete.textContent = '완료';
+        btnComplete.className = 'action-btn complete';
+        btnComplete.onclick = () => { updateStatus('complete'); closeDetail(); };
+    }
+
+    // 보류 상태면 초기화 버튼으로 전환
+    if (status.state === 'hold') {
+        btnHold.textContent = '초기화';
+        btnHold.className = 'action-btn reset';
+        btnHold.onclick = () => resetStatus();
+    } else {
+        btnHold.textContent = '보류';
+        btnHold.className = 'action-btn hold';
+        // 보류도 같은 칸(#fail-reason)의 값을 사유로 싣는다 — updateStatus 가 읽는다.
+        //   ★불가와 달리 **사유를 강제하지 않는다**. 지시는 "남길 수 있게" 였고, 현장에서
+        //     일단 보류부터 찍는 흐름을 막으면 안 된다. 비워 두면 사유 없이 보류로 남는다.
+        btnHold.onclick = () => {
+            const failInput = document.getElementById('fail-reason');
+            if (failInput) failInput.style.borderColor = '';
+            updateStatus('hold');
+            closeDetail();
+        };
+    }
+
+    // 불가 상태면 초기화 버튼으로 전환
+    if (status.state === 'fail') {
+        btnFail.textContent = '초기화';
+        btnFail.className = 'action-btn reset';
+        btnFail.onclick = () => resetStatus();
+    } else {
+        btnFail.textContent = '불가';
+        btnFail.className = 'action-btn fail';
+        btnFail.onclick = () => {
+            const failInput = document.getElementById('fail-reason');
+            const reason = failInput.value.trim();
+            if (!reason) {
+                failInput.style.borderColor = '#ef4444';
+                return;
+            }
+            failInput.style.borderColor = '';
+            updateStatus('fail');
+            closeDetail();
+        };
+    }
+
+    // 현재 상태에 맞는 버튼 활성화
+    [btnComplete, btnHold, btnFail].forEach(btn => btn.classList.remove('active'));
+    if (status.state === 'complete') btnComplete.classList.add('active');
+    if (status.state === 'hold') btnHold.classList.add('active');
+    if (status.state === 'fail') btnFail.classList.add('active');
+
+    const failInput = document.getElementById('fail-reason');
+    failInput.value = status.reason || '';
+    failInput.style.borderColor = '';
+    // 같은 칸을 불가·보류가 나눠 쓴다(칸을 새로 만들지 않는다 — 영준님 지시).
+    //   지금 상태에 맞춰 안내만 바꾼다. 아직 안 정한 pending 이면 둘 다 알려 준다.
+    failInput.placeholder = status.state === 'hold' ? '보류 사유'
+                          : status.state === 'fail' ? '불가 사유'
+                          : '불가 / 보류 사유';
+    // 열었을 때의 사유 — 실제로 바뀌었는지 판단하는 기준
+    failInput.dataset.orig = status.reason || '';
+    failInput.oninput = (e) => {
+        if (e.target.value.trim()) e.target.style.borderColor = '';
+        // 입력 중: 로컬만 저장. ★완료(complete) 건은 이 칸이 사유 칸이 아니므로 로컬도 건드리지 않는다.
+        if (!workStatus[currentStatusKey]) {
+            workStatus[currentStatusKey] = { state: 'pending', checkedMeters: [], reason: '' };
+        }
+        if (workStatus[currentStatusKey].state === 'complete') return;
+        workStatus[currentStatusKey].reason = e.target.value;
+        // ★보관은 persistStatus 로 맡긴다(IndexedDB + 디바운스). localStorage 직접 쓰기 금지(quota).
+        persistStatus();
+    };
+    // blur/Enter — ★불가·보류이면서 사유가 실제로 바뀐 경우에만, **reason 필드만** 저장한다.
+    //   전엔 (1) 패널을 열 때마다 addEventListener 로 리스너가 누적돼 N번 열면 N번 썼고
+    //   (2) 완료 건에서도 saveStateEvent 로 state·updatedBy 를 다시 써서, 사유칸을 스친 사람에게
+    //   남의 과거 완료 실적이 옮겨갔다(2026-10-19 감사). on* 속성 대입이라 리스너는 늘 1개다.
+    const flushFailReason = () => {
+        const v = failInput.value.trim();
+        if (v === String(failInput.dataset.orig || '').trim()) return;
+        const targets = (currentStatusKeys && currentStatusKeys.length) ? currentStatusKeys : [currentStatusKey];
+        let saved = false;
+        targets.forEach(k => {
+            const st = workStatus[k] && workStatus[k].state;
+            if (st === 'fail' || st === 'hold') { saveReasonEvent(k, v); saved = true; }
+        });
+        if (saved) failInput.dataset.orig = v;
+    };
+    failInput.onblur = flushFailReason;
+    failInput.onkeydown = (e) => { if (e.key === 'Enter') { flushFailReason(); failInput.blur(); } };
+
+    // 작업자 정보 표시 (기능 4)
+    // 디버그: showDetail에서 읽어온 status 확인
+    console.log('[showDetail] status:', {
+        state:         status.state,
+        updatedByName: status.updatedByName,
+        updatedAt:     status.updatedAt,
+    });
+    updateWorkerInfo(status);
+
+    // 변대주(전산화/DCUID)가 모두 같은 경우 공통 표시
+    // - 영문자 포함: DCU 케이스 → 끝 2자리(차수+번호) 강조 + 복사 시 절단
+    // - 숫자만: LTE 케이스 (DCU 미사용) → 강조 없음 + 전체 복사
+    const commonPoleEl = document.getElementById('common-pole');
+    if (isPoleCommon(meters)) {
+        const POLE_ICON = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
+        const pole = poleDisplay(poleMeterForDisplay(meters[0]), POLE_ICON, 'margin-left:6px;');
+        // 라벨 '변대주' + 전산화번호 + 차수(회색) + (전주명) + 통신방식.
+        //   전주명 괄호는 종로맵과 형식을 맞춘 것이다(영준님 지적 2026-08-19).
+        //   통신방식은 대장에서 확정된 값이다.
+        // ★대장 조회를 거친 리스트(25미청구·미청구불가)는 여기에 **대장 값만** 올린다
+        //   (영준님 2026-09-20 "변대주 필드는 변대주 필드임"). 그 리스트의 `통신방식` 은
+        //   계기에 지금 달려 있는 것이라 뜻이 다르다 — 디테일의 '현재 통신방식'으로 내린다.
+        const ledgerLine = dcuLedgerLine(meters[0]);
+        const isLedger = !!meters[0].대장출처;
+        const commTxt = (!isLedger && meters[0].통신방식)
+            ? `<span style="margin-left:10px;color:#dc2626;">${meters[0].통신방식}</span>` : '';
+        const ledgerTxt = ledgerLine
+            ? `<span style="margin-left:10px;">${ledgerLine}</span>` : '';
+        // ★라벨('변대주 ')을 뗐다(영준님 2026-09-20) — 값부터 시작한다.
+        //   최종 형태: 'DCU ID (전주명) [복사] 차수 · 통신방식 · 회선상태 · 철거판정'.
+        //   복사 버튼 값은 **전산화번호 그대로** 둔다 — awms 에 넣는 값이 그것이다.
+        commonPoleEl.innerHTML = `${pole.html}${commTxt}${ledgerTxt}`;
+        commonPoleEl.style.display = 'block';
+        commonPoleEl.querySelector('.pole-copy-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            copyMeterNo(pole.copyVal);
+        });
+    } else {
+        commonPoleEl.style.display = 'none';
+    }
+
+    // DCU 철거예정 표기 — 큰 글씨 공통줄에 '변대주명 + 판정'을 한 줄 더 붙인다.
+    //   (영준님 지시 2026-08-02: 변대주 값 안이 아니라 위 큰 글씨에)
+    //   판정은 data 의 dcu_철거예정 필드('DCU 철거예정 개소 LTE 시설' | 'DCU 유지').
+    //   DCUID 가 없어 위 블록이 숨겨진 경우에도 태그가 있으면 줄을 살린다.
+    const dcuTag = meters.find(m => m.dcu_철거예정)?.dcu_철거예정 || '';
+    if (dcuTag) {
+        // ★DCU 는 변대주에 붙는다 — 철거예정 판정도 변대주 기준이므로 인입주를 쓰면 안 된다
+        //   (영준님 2026-08-12). 인입주를 먼저 보던 탓에 다른 전주 이름이 태그 옆에 찍혔다.
+        const poleName = meters.find(m => m.변대주);
+        const nameTxt = (poleName && poleName.변대주) || '';
+        const isRemove = dcuTag.indexOf('철거') !== -1;
+        // ★충돌 표시 (영준님 2026-09-15) — **철거예정인데 통신방식이 DCU 계열**인 개소.
+        //   회선상태로는 절대 안 걸린다: 철거예정 개소는 회선상태가 전부 '개통' 이다.
+        //   그대로 두면 작업자가 PLC 로 알고 갔다가 곧 철거될 DCU 에 물리게 된다 —
+        //   실제로는 LTE 로 시공해야 한다. 그래서 '현재 무엇으로 적혀 있는지'를 같이 보여준다.
+        //   ※카테고리로 걸지 않는다 — 실효에도 같은 충돌이 있다(태그 4건 전부 KS-PLC·HPGP).
+        //   ※단 **대장 조회를 거친 리스트(25미청구·미청구불가)에서는 띄우지 않는다**
+        //     (영준님 2026-09-20 "변대주 필드는 변대주 필드임"). 그 리스트의 `통신방식` 은
+        //     계기에 지금 달려 있는 것이고 상단은 변대주(DCU) 것이라, 둘이 다른 게 정상이다
+        //     (실측 1,187건). 여기서 비교해 문구를 띄우면 없는 모순을 만들어낸다.
+        const DCU_COMM = ['PLC', 'KS-PLC', 'K-DCU', 'HPGP'];
+        const commMeter = meters.some(m => m.대장출처) ? null
+            : meters.find(m => m.통신방식 && DCU_COMM.indexOf(m.통신방식) !== -1);
+        const conflictTxt = (isRemove && commMeter)
+            ? ` — 현재 ${commMeter.통신방식} 로 적혀 있으나 LTE 로 시공` : '';
+        const tagHtml =
+            `<div style="margin-top:${commonPoleEl.style.display === 'block' ? '4px' : '0'};` +
+            `color:${isRemove ? '#b91c1c' : '#1d4ed8'};">` +
+            `${nameTxt ? nameTxt + ' ' : ''}${dcuTag}${conflictTxt}</div>`;
+        commonPoleEl.innerHTML += tagHtml;
+        commonPoleEl.style.display = 'block';
+    }
+
+    // 재작업 알림 (rework=true) — 상단에 표시
+    const reworkEl = document.getElementById('rework-notice');
+    if (reworkEl) {
+        // ★완료 시점에 아직 존재하지도 않던 계기에는 재작업 알림을 띄우지 않는다.
+        //   workStatus 키가 '주소'라 완료기록이 그 주소에 나중에 들어온 계기까지 덮는다.
+        //   이 주소 계기들의 교체일이 전부 이전 완료일보다 늦으면 그 완료는 이 계기들 것이 아니다
+        //   (실측 2026-09-08: 19주소 49계기. 예 79450105657 교체 6/25 > 완료 6/23).
+        //   ★데이터는 지우지 않는다 — 표시만 거른다. 판정은 계기 단위로 scripts/classify_jae.py 가 한다.
+        const prevAtRaw = status.previousCompleteAt || '';
+        const prevDay = String(prevAtRaw).slice(0, 10);
+        const swapDays = (meters || [])
+            .map(m => String((m && m.계기교체일) || '').slice(0, 10))
+            .filter(Boolean);
+        const staleNotice = !!prevDay && swapDays.length > 0
+            && swapDays.every(d => d > prevDay);
+
+        if (status.rework === true && !staleNotice) {
+            // 이전 완료자: 이름 우선, 없으면 ID를 계정명으로 변환
+            const prevRaw = status.previousCompleteByName || status.previousCompleteBy || '';
+            let prevName = prevRaw;
+            if (typeof ACCOUNTS !== 'undefined') {
+                const acc = ACCOUNTS.find(a => a.id === prevRaw);
+                if (acc) prevName = acc.name;
+            }
+            const prevAt = status.previousCompleteAt || '';
+            let prevDate = '';
+            if (prevAt) {
+                try {
+                    const d = new Date(prevAt);
+                    prevDate = kstDayLabel(d);
+                } catch (e) { prevDate = prevAt; }
+            }
+            reworkEl.textContent = `재작업 — 이전 완료: ${prevName} ${prevDate}`;
+            reworkEl.style.display = 'block';
+        } else {
+            reworkEl.style.display = 'none';
+        }
+    }
+
+    // 패널 열릴 때 검색창 초기화
+    const searchEl = document.getElementById('meter-search');
+    if (searchEl) { searchEl.value = ''; }
+
+    // 패널 열릴 때 정렬 상태 초기화 + 버튼 UI 동기화
+    currentSortMode = 'none';
+    updateSortBtnUI();
+
+    // 계기 목록 렌더링
+    renderMetersList();
+
+    document.getElementById('fullpage-overlay').classList.add('active');
+}
+
+// 상태 색상 바 업데이트 (기능 3)
+function updateStatusBar(state) {
+    const bar = document.getElementById('status-bar');
+    if (!bar) return;
+
+    const colorMap = {
+        complete: '#10b981',
+        hold:     '#3b82f6',
+        fail:     '#ef4444',
+    };
+
+    if (state === 'pending' || !colorMap[state]) {
+        bar.style.background = 'transparent';
+    } else {
+        bar.style.background = colorMap[state];
+    }
+}
+
+// 작업자 정보 표시 업데이트 (기능 4)
+function updateWorkerInfo(status) {
+    const workerEl = document.getElementById('worker-info');
+    if (!workerEl) return;
+
+    // pending이거나 작업자 정보 없으면 숨김
+    if (
+        status.state === 'pending' ||
+        !status.updatedByName ||
+        !status.updatedAt
+    ) {
+        workerEl.style.display = 'none';
+        workerEl.textContent = '';
+        return;
+    }
+
+    // updatedAt을 "M월 D일" 형식으로 변환
+    let dateStr = '';
+    try {
+        const d = new Date(status.updatedAt);
+        dateStr = kstDayLabel(d);
+    } catch (e) {
+        dateStr = status.updatedAt;
+    }
+
+    // 사유 — 불가·보류 둘 다 여기 같은 자리에 띄운다(영준님 2026-09-10).
+    //   전에는 입력칸 안에만 보였는데, 그 칸은 '고치는 곳'이지 '읽는 곳'이 아니다.
+    //   색은 상태색을 따른다(보류 파랑 #3b82f6 · 불가 빨강 #ef4444 — updateStatusBar 와 같은 값).
+    const REASON_COLOR = { hold: '#3b82f6', fail: '#ef4444' };
+    const reason = String(status.reason || '').trim();
+    const line = `${status.updatedByName} / ${dateStr} 작업`;
+    if (reason && REASON_COLOR[status.state]) {
+        const label = status.state === 'hold' ? '보류 사유' : '불가 사유';
+        // 사유는 작업자가 손으로 적는 자유 문자열이라 반드시 이스케이프한다.
+        //   (showDetail 안의 esc 는 그 함수 지역 변수라 여기서 못 쓴다 — 같은 규칙으로 둔다)
+        const escv = (s) => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+                                     .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        workerEl.innerHTML = `${escv(line)} · `
+            + `<span style="color:${REASON_COLOR[status.state]};font-weight:700;">`
+            + `${escv(label)} ${escv(reason)}</span>`;
+    } else {
+        workerEl.textContent = line;
+    }
+    workerEl.style.display = 'block';
+}
+
+// ── 계기 목록 렌더링 ─────────────────────────────────────────
+
+// 현재 정렬 모드에 따라 계기 목록을 정렬해서 반환
+function getSortedMeters() {
+    const meters = currentMeters;
+    if (currentSortMode === 'dup') {
+        // 뒤 2자리 기준 그룹 정렬 (같은 뒤2자리끼리 인접)
+        return [...meters].sort((a, b) => {
+            // 장애 데이터셋은 한 레코드가 MAC 그룹이라 계기번호가 없다 — 널가드 필수.
+            const sa = String(a.계기번호 || '').slice(-2);
+            const sb = String(b.계기번호 || '').slice(-2);
+            if (sa !== sb) return sa.localeCompare(sb);
+            return meters.indexOf(a) - meters.indexOf(b); // 그룹 내 원래 순서 유지
+        });
+    }
+    if (currentSortMode === 'maker') {
+        // 앞 2자리 기준 그룹 정렬 (같은 메이커 코드끼리 인접)
+        return [...meters].sort((a, b) => {
+            const pa = String(a.계기번호 || '').slice(0, 2);
+            const pb = String(b.계기번호 || '').slice(0, 2);
+            if (pa !== pb) return pa.localeCompare(pb);
+            return meters.indexOf(a) - meters.indexOf(b); // 그룹 내 원래 순서 유지
+        });
+    }
+    // 'none': 원래 순서
+    return meters;
+}
+
+// 계기 개별 불가 토글 — 저장·전송은 firebase.js saveMeterFailEvent 한 곳에서(체크와 같은 길)
+function toggleMeterFail(meterNumber) {
+    if (!String(meterNumber || '').trim()) { console.warn('[meterFail] 빈 계기번호 — 저장 거부'); return; }
+    const status = workStatus[currentStatusKey] || {};
+    const isFailed = !!(status.failedMeters && status.failedMeters[meterNumber] !== undefined);
+    if (isFailed) {
+        _meterFailPending.delete(meterNumber);
+        saveMeterFailEvent(currentStatusKey, meterNumber, false);
+        renderMetersList();
+    } else {
+        saveMeterFailEvent(currentStatusKey, meterNumber, true, '');
+        renderMetersList();
+        // 렌더링 후 해당 입력창에 포커스
+        setTimeout(() => {
+            const input = document.querySelector(`.meter-fail-input[data-meter="${meterNumber}"]`);
+            if (input) input.focus();
+        }, 50);
+    }
+}
+
+// 계기 불가 사유 — 입력 중엔 로컬만 갱신하고 1초 쉬면 전송, Enter·blur·상세 닫기 때 즉시 전송
+const _meterFailPending = new Map();   // meter → { addr, reason, timer }
+const METER_FAIL_DEBOUNCE_MS = 1000;
+
+function saveMeterFailReason(meterNumber, reason, addr) {
+    const a = addr || currentStatusKey;
+    const pend = _meterFailPending.get(meterNumber);
+    if (pend) { clearTimeout(pend.timer); _meterFailPending.delete(meterNumber); }
+    const st = workStatus[a];
+    if (!st || !st.failedMeters || st.failedMeters[meterNumber] === undefined) return;   // 그 사이 해제됨
+    // 바뀐 게 없으면 보내지 않는다 — 같은 값을 또 쓰면 서버 응답으로 목록이 다시 그려져
+    //   바로 이어 누른 '불가해제' 클릭이 사라졌다(2026-10-19 야간 검증에서 재현).
+    if (!pend && st.failedMeters[meterNumber] === reason) return;
+    saveMeterFailEvent(a, meterNumber, true, reason);
+}
+
+function queueMeterFailReason(meterNumber, reason) {
+    const a = currentStatusKey;
+    const st = workStatus[a];
+    if (!st || !st.failedMeters || st.failedMeters[meterNumber] === undefined) return;
+    st.failedMeters[meterNumber] = reason;          // 로컬 즉시 반영(다시 그려도 입력값 유지)
+    const prev = _meterFailPending.get(meterNumber);
+    if (prev) clearTimeout(prev.timer);
+    const timer = setTimeout(() => saveMeterFailReason(meterNumber, reason, a), METER_FAIL_DEBOUNCE_MS);
+    _meterFailPending.set(meterNumber, { addr: a, reason, timer });
+}
+
+function flushMeterFailReasons() {
+    for (const [m, p] of Array.from(_meterFailPending.entries())) saveMeterFailReason(m, p.reason, p.addr);
+}
+
+// 추가된 계기(added_meters)를 currentMeters에 가짜 객체로 합쳐서 함께 표시
+function getMetersWithAdded() {
+    const base = currentMeters || [];
+    const status = workStatus[currentStatusKey] || {};
+    const added = status.added_meters || {};
+    // ★추가계기는 Firebase 에서 온다 — 형식이 아닌 값(문자열 아님·스크립트)은 그리지 않는다.
+    const addedList = Object.values(added).filter(a => {
+        const ok = a && typeof a.meter_id === 'string' && METER_NO_RE.test(a.meter_id);
+        if (!ok) console.warn('[added_meters] 형식 아닌 값 무시:', a && a.meter_id);
+        return ok;
+    }).map(a => ({
+        계기번호: a.meter_id,
+        계기타입: parseType(a.meter_id) || '?',
+        주소: currentAddress,
+        도로명주소: base[0]?.도로명주소 || '',
+        DCUID: '',
+        category: base[0]?.category || '실효',
+        __added: true,
+        __added_meta: a,
+    }));
+    return base.concat(addedList);
+}
+
+function bindMetersListOnce(metersList) {
+    if (!metersList || metersList.dataset.bound === '1') return;
+    metersList.dataset.bound = '1';
+    metersList.addEventListener('change', (e) => {
+        const cb = e.target.closest('.meter-checkbox');
+        if (cb && metersList.contains(cb)) toggleMeterCheck(cb.dataset.meter);
+    });
+    metersList.addEventListener('click', async (e) => {
+        const t = e.target;
+        // 장애 트리 — MAC 그룹 전체선택/해제. 한 함체 계기를 하나씩 누르면 20번 눌러야 한다.
+        const all = t.closest('.jangae-all');
+        if (all) {
+            e.stopPropagation();
+            const box = all.closest('.jangae-group');
+            if (!box) return;
+            const cbs = [...box.querySelectorAll('.meter-checkbox')];
+            const turnOn = cbs.some(c => !c.checked);   // 하나라도 꺼져 있으면 전체 켜기
+            cbs.forEach(c => {
+                if (c.checked !== turnOn) { c.checked = turnOn; toggleMeterCheck(c.dataset.meter); }
+            });
+            return;
+        }
+        const copy = t.closest('.copy-btn');
+        if (copy) { e.stopPropagation(); copyMeterNo(copy.dataset.copy); return; }
+        const fail = t.closest('.meter-fail-btn');
+        if (fail) { e.stopPropagation(); toggleMeterFail(fail.dataset.meter); return; }
+        const rm = t.closest('.meter-add-remove-btn');
+        if (rm) {
+            e.stopPropagation();
+            const m = rm.dataset.meter;
+            if (!confirm(`추가 계기 ${m}를 삭제할까요?`)) return;
+            try {
+                await removeAddedMeter(currentStatusKey, m);
+                renderMetersList();
+                if (typeof updateMarkerColor === 'function') updateMarkerColor(currentStatusKey);
+            } catch (err) {
+                alert('삭제 실패: ' + err.message);
+            }
+        }
+    });
+    // 불가 사유 입력창 — 엔터·포커스아웃 즉시 저장, 입력 중엔 1초 디바운스
+    metersList.addEventListener('keydown', (e) => {
+        const inp = e.target.closest('.meter-fail-input');
+        if (inp && e.key === 'Enter') { saveMeterFailReason(inp.dataset.meter, inp.value.trim()); inp.blur(); }
+    });
+    metersList.addEventListener('focusout', (e) => {
+        const inp = e.target.closest('.meter-fail-input');
+        if (inp) window.__meterInputLeftAt = Date.now();   // 직후 다시 그리기를 잠깐 미룬다(firebase.js)
+        if (inp) saveMeterFailReason(inp.dataset.meter, inp.value.trim());
+    });
+    metersList.addEventListener('input', (e) => {
+        const inp = e.target.closest('.meter-fail-input');
+        if (inp) queueMeterFailReason(inp.dataset.meter, inp.value.trim());
+    });
+}
+
+// 계기 목록 HTML 생성 및 렌더링
+function renderMetersList() {
+    // 관리자 여부 (추가계기 삭제 등 관리자 전용 UI 제어)
+    const isAdmin = (typeof authGetSession === 'function') && ((authGetSession() || {}).role === 'admin');
+    const meters = getMetersWithAdded();
+    // currentMeters를 임시로 합친 배열로 교체 (정렬 함수가 currentMeters 참조)
+    const origCurrent = currentMeters;
+    currentMeters = meters;
+    const sortedMeters = getSortedMeters();
+    currentMeters = origCurrent;
+    const status = workStatus[currentStatusKey] || { state: 'pending', checkedMeters: [], reason: '' };
+    // 큰 글씨(공통) 영역에 표시되었는지 — 위 showDetail 과 **같은 판정**을 쓴다(isPoleCommon).
+    //   따로 계산하면 둘이 어긋나 변대주가 두 번 나오거나 아예 사라진다.
+    const commonDcuShown = isPoleCommon(meters);
+    const failedMeters = status.failedMeters || {};
+
+    // 뒤 2자리 중복 그룹 계산 (중복 계기번호 색상 구분용)
+    const suffix2Map = {};
+    meters.forEach(m => {
+        if (!m.계기번호) return;            // 장애(MAC 그룹) 레코드는 계기번호가 없다
+        const s = String(m.계기번호).slice(-2);
+        if (!suffix2Map[s]) suffix2Map[s] = [];
+        suffix2Map[s].push(m.계기번호);
+    });
+    // suffix → 그룹 인덱스 (0-based)
+    const dupGroupIndex = {};
+    let gIdx = 0;
+    Object.entries(suffix2Map).forEach(([s, nos]) => {
+        if (nos.length > 1) dupGroupIndex[s] = gIdx++;
+    });
+    // 그룹 인덱스 → CSS 클래스 방식 (인라인 스타일 대신 dup-row-N 클래스 사용)
+    function rowClass(s2) {
+        if (dupGroupIndex[s2] === undefined) return '';
+        return `dup-row-${dupGroupIndex[s2] % 10}`;
+    }
+
+    // 검색 필터
+    const searchVal = (document.getElementById('meter-search')?.value || '').replace(/\D/g, '');
+    const filtered = (searchVal.length >= 2)
+        ? sortedMeters.filter(m => String(m.계기번호 || '').includes(searchVal))
+        : sortedMeters;
+
+    // ── 모뎀 MAC 묶음 (영준님 2026-09-22 "맥 색 강조하고 맥끼리 묶어 놔") ──────────
+    //   왜: 한 주소에 **함체가 둘 이상**인 개소가 있다. 성산동 200-205 는 청구가 끝난 함체
+    //   (MAC 01254069886)와 미청구 함체(01254426174)가 같이 있어서, 지도만 보고 간 작업자가
+    //   어느 모뎀이 대상인지 화면에서 가릴 수 없었다(2026-09-22 실측).
+    //   ★MAC 이 한 종류뿐이면 묶지 않는다 — 묶을 것이 없는데 헤더만 붙으면 화면만 길어진다.
+    //   ★장애 데이터셋은 한 레코드가 이미 MAC 그룹이고 자기 트리를 따로 그린다(jangaeTreeHtml).
+    //     그 위에 또 묶으면 트리가 이중으로 감싸지므로 섞여 있으면 묶지 않는다.
+    //   ★키는 화면에 그리는 값과 **같은 식으로** 만든다(모뎀MAC_awms 우선 + 영숫자만).
+    //     다르게 만들면 헤더의 MAC 과 카드의 MAC 이 어긋난다.
+    const macKeyOf = (m) => String(m.모뎀MAC_awms || m.모뎀MAC || '').replace(/[^0-9A-Za-z]/g, '');
+    const hasJangae = filtered.some(m => m.category === '장애');
+    const macKinds = new Set(filtered.map(macKeyOf).filter(Boolean));
+    const macGrouped = !hasJangae && macKinds.size >= 2;
+
+    const metersList = document.getElementById('meters-list');
+    const meterCards = filtered.map(meter => {
+        // 장애 데이터셋은 단위가 다르다 — 한 레코드가 **모뎀 MAC 그룹**이라 계기 한 줄이 아니라
+        //   MAC 헤더 + 그 밑 계기 트리를 그린다. 같은 주소에 MAC 이 둘이면 트리가 둘 생긴다
+        //   (영준님 지시 2026-08-31 "맥이 여러개면 모달 안에 트리가 두개").
+        //   계기목록에는 시트2(모뎀작업리스트)에서 끌어온 **정상 계기까지** 들어 있고,
+        //   장애 시트에 있던 것만 `장애:true` 다 — 정상은 정상으로 두고 장애만 색을 준다.
+        if (meter.category === '장애') {
+            // 같은 주소에 MAC 이 여럿이면 트리가 여럿 그려진다. 몇 번째 MAC 인지 넘겨
+            //   MAC 뒤 2자리에 색을 갈라 붙인다(영준님 지시 2026-09-01).
+            const jIdx = filtered.filter(m => m.category === '장애').indexOf(meter);
+            const jTot = filtered.filter(m => m.category === '장애').length;
+            return jangaeTreeHtml(meter, jIdx, jTot, status.checkedMeters || []);
+        }
+        const checked = (status.checkedMeters || []).includes(meter.계기번호) ? 'checked' : '';
+        const parsedType = parseType(meter.계기번호) || meter.계기타입;
+        const detailParts = [];
+        // 변대주/DCU 큰 글씨 — 공통 표시 안 될 때만 개별 표시.
+        //   ★조건이 공통 블록과 같아야 한다(전산화번호 또는 DCUID). DCUID 만 보면 LTE 개소가
+        //     공통에서도 개별에서도 빠져 변대주가 어디에도 안 나온다(영준님 지적 2026-08-19).
+        //   전산화번호가 있으면 라벨도 '변대주'로 맞춘다 — 실제로 그리는 값이 변대주이기 때문.
+        //   없으면 예전 그대로 'DCU ID'(영문자면 끝 2자리 강조 + 복사 시 절단, 숫자만이면 전체).
+        //   ★대장 조회를 거친 리스트는 대장에 없는 개소의 원장 DCUID 를 그리지 않는다
+        //     (poleMeterForDisplay). 그 개소는 'DCU 없음' 이지 'DCU 가 이것' 이 아니다.
+        const poleM = poleMeterForDisplay(meter);
+        if (!commonDcuShown && (poleNoOf(poleM) || poleM.DCUID)) {
+            const P_ICON = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
+            const p = poleDisplay(poleM, P_ICON, 'margin-left:3px;');
+            // 대장 묶음(DCU ID·통신방식·회선상태·철거판정)은 변대주 줄에 이어 붙인다.
+            //   공통줄이 떴으면 거기 이미 있으므로 여기선 안 그린다(같은 값 두 번 금지).
+            //   ★라벨('변대주 '/'DCU ID ')을 뗐다(영준님 2026-09-20) — 값부터 시작한다.
+            const lg = dcuLedgerLine(meter);
+            detailParts.push(p.html
+                + (lg ? ` <span style="font-size:0.9em;">${lg}</span>` : ''));
+        } else if (!commonDcuShown && meter.대장출처 && meter.변대주) {
+            // 변대주명만 있고 번호·DCU 가 없는 개소(25미청구 202 · 불가 21).
+            //   ★전주 표찰 이름은 현장에서 쓰이니 남긴다. DCU 부분은 붙이지 않는다(빈칸).
+            const lg = dcuLedgerLine(meter);
+            detailParts.push(meter.변대주
+                + (lg ? ` <span style="font-size:0.9em;">${lg}</span>` : ''));
+        }
+        // 상호 (있을 때)
+        if (meter.상호 && meter.상호 !== '0') detailParts.push(`상호 ${meter.상호}`);
+        // 공동주택명 (상호와 다를 때만)
+        if (meter.공동주택명 && meter.공동주택명 !== meter.상호) detailParts.push(meter.공동주택명);
+        // 합친 마커: 이 계기의 지번이 대표 지번과 다를 때만 노출 (도로명 같고 지번 다른 케이스).
+        //   기존 도로명/지번 표시는 그대로, 주택명·상호 밑에 "다른 지번"만 추가.
+        //   (renderMetersList는 무인자 — 전역 currentAddress 기준, 주변 코드 따라 esc 없음)
+        if (meter.주소 && meter.주소 !== currentAddress) {
+            detailParts.push(`<span style="color:#9ca3af;">지번 ${meter.주소}</span>`);
+        }
+        // 작은 글씨 영역
+        const subParts = [];
+        // 1) 통신방식 · 변대주 한글명 · 인입주
+        //   ★빨강 강조를 뗐다(영준님 2026-09-20) — 지금 달려 있는 값이라 강조할 이유가 없다.
+        //   ★대장 조회를 거친 리스트는 위 변대주 줄에도 통신방식이 나온다(대장=DCU 인입망).
+        //     뜻이 다르니 라벨을 갈라 준다: 상단 'DCU … PLC' / 여기 '현재 통신방식 LTE'.
+        //     어느 리스트인지는 `대장출처` 유무로 안다 — 그 리스트에만 있는 필드다.
+        //   ★모뎀 MAC 칸이 아예 없는 리스트에서는 안 그린다(영준님 2026-09-20).
+        //     25년 미청구불가가 그렇다 — 모뎀을 못 단 개소라 '현재 통신방식'이라 부를 것이
+        //     없다. 실려 있는 값은 계기가 원래 쓰던 방식이지 우리가 단 모뎀의 방식이 아니고,
+        //     상단의 DCU 통신방식과 헷갈리기만 한다. ★데이터에는 남긴다 — 화면에서만 뺀다.
+        //   ★값이 아니라 **칸(키)의 유무**로 건다. "값이 비었다"와 "그 리스트는 그 개념을
+        //     갖지 않는다"는 다르다 — 실효는 MAC 칸이 있는데 값이 37건뿐이라(3,166 중)
+        //     값으로 걸면 실효의 통신방식이 통째로 사라진다. 불가 빌더는 MAC 칸 자체를
+        //     만들지 않는데(원본 MAC 칸에 계기번호가 들어 있어 뺐다) 그게 곧 모뎀 미시공 표식이다.
+        const hasMacCol = Object.prototype.hasOwnProperty.call(meter, '모뎀MAC')
+            || Object.prototype.hasOwnProperty.call(meter, '모뎀MAC_awms');
+        if (meter.통신방식 && hasMacCol) {
+            subParts.push(meter.대장출처 ? `현재 통신방식 ${meter.통신방식}` : meter.통신방식);
+        }
+        // 변대주 — 이름 + 전산화번호.
+        //   2026-08-06 에 번호를 뺀 것은 **큰 글씨(상위)에서 강등**한다는 뜻이었고, 디테일에는
+        //   있어야 한다(영준님 2026-08-12 정정). 그때 문제였던 "대장에서 이름으로 찾은 번호가
+        //   16% 어긋난다"는 여기 해당하지 않는다 — 아래 값은 별도 소스가 아니라 **DCUID 에서
+        //   끝 2자리(DCU 차수)를 뗀 도출값**이라 DCU ID 줄과 항상 정합한다.
+        //   ★숫자형 DCUID 는 전산화번호가 아니라 LTE 회선번호(012 생략)라 붙이지 않는다.
+        if (meter.변대주 || poleNoOf(meter)) {
+            const dcuRaw = meter.DCUID || '';
+            // 전산화번호 — 변대주전산화(합동 종로)·변대주번호(25미청구 계열)가 있으면 그것을 쓴다.
+            //   LTE 는 DCUID 가 없어 예전 방식(DCUID 에서 끝 2자리 절단)으로는 번호가 안 나왔다.
+            //   그 필드가 없는 실효·재방문·고압은 예전 그대로 도출값을 쓴다.
+            const bdjuNo = poleNoOf(meter) || (/[A-Za-z]/.test(dcuRaw) ? dcuRaw.slice(0, -2) : '');
+            // ★이름이 없고 번호만 있는 건도 그린다(미청구 728건·불가 1,715건).
+            //   예전엔 이름이 없으면 줄 자체가 빠져 번호까지 같이 사라졌다.
+            subParts.push(meter.변대주
+                ? `변대주 ${meter.변대주}${bdjuNo ? ` (${bdjuNo})` : ''}`
+                : `변대주번호 ${bdjuNo}`);
+        }
+        // DCU 상태(회선상태·장애여부) 표시는 뺐다 — 영준님 2026-08-12: 우리 대상은 원본이
+        //   'DCU 장애여부 = 정상' 으로 걸러 받은 개소라 다 정상이고, 확정적으로 받은 것은
+        //   3번 시트(철거/유지 판정)뿐이다. 그 판정은 위 큰 글씨에 이미 나온다.
+        //   필드(dcu_회선상태·dcu_장애여부)는 데이터에 남겨 두었다 — 필요하면 되살린다.
+        // 인입주 — 변대주 줄과 같은 형식(이름 + 전산화번호). 전산화번호가 실린 데이터셋만 붙는다.
+        //   ★DCU 판정에는 절대 쓰지 않는다. DCU 는 변대주에 붙는다(영준님 2026-08-12 확정,
+        //     아래 dcu_철거예정 줄 주석 참조). 여기는 표시 전용이다.
+        if (meter.인입주) {
+            const inNo = meter.인입주전산화 || '';
+            subParts.push(`인입주 ${meter.인입주}${inNo ? ` (${inNo})` : ''}`);
+        }
+        // 2) 사업차수 (신·전)
+        if (meter['사업차수']) {
+            const prev = meter['사업차수_전'];
+            subParts.push(prev && prev !== meter['사업차수'] ? `차수 ${meter['사업차수']}(전 ${prev})` : `차수 ${meter['사업차수']}`);
+        }
+        // 3) 이전 통신 (항상) · 이전 계기 (신과 다를 때만)
+        if (meter['통신방식_전']) subParts.push(`이전통신 ${meter['통신방식_전']}`);
+        if (meter['계기타입_전'] && meter['계기타입_전'] !== meter.계기타입) subParts.push(`이전계기 ${meter['계기타입_전']}`);
+        // 4) 고객번호
+        if (meter.고객번호) {
+            // 고객번호 복사 — 계기번호·주소와 같은 copy-btn + data-copy (목록 위임 핸들러가 받는다)
+            const cust = String(meter.고객번호);
+            subParts.push(`고객 ${cust}<button class="copy-btn" data-copy="${cust}" title="고객번호 복사" style="margin-left:2px;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>`);
+        }
+        // 5) 실효 미사용 컬럼 살리기 (값 있고 의미 있을 때만)
+        if (meter.검기만료년월) subParts.push(`검기만료 ${meter.검기만료년월}`);
+        // 합동은 교체사유가 전 건 '합동시공' 고정이라, 아래 10)의 '합동시공·모뎀미시공' 과
+        //   겹쳐 "사유 합동시공 · 합동시공·모뎀미시공" 으로 두 번 나왔다. 강조된 쪽만 남긴다.
+        if (meter.교체사유 && meter.category !== '합동') subParts.push(`사유 ${meter.교체사유}`);
+        // 모뎀MAC — 작업자가 awms 에 넣는 값이라 **복원한 표기**를 보여준다.
+        //   보강현황 원본은 인코딩된 형태(504050203010604)라 그대로 보면 쓸모가 없다.
+        //   복원에 실패하면 원본이라도 보여준다(빈칸보다 낫다).
+        //   ★고압·TOU 는 자기 블록에서 이미 그리므로 여기서 빼 중복을 막는다.
+        if (meter.category !== '고압' && meter.category !== 'tou') {
+            // ★MAC 은 [0-9A-F]/숫자만 남긴다. 이 함수에는 esc() 가 없고(showDetail 지역 상수라
+            //   그대로 쓰면 ReferenceError 로 계기목록이 통째로 안 그려진다), 값이 데이터 유래라
+            //   화이트리스트가 이스케이프보다 확실하다.
+            const macShow = String(meter.모뎀MAC_awms || meter.모뎀MAC || '')
+                .replace(/[^0-9A-Za-z]/g, '');
+            //   ★묶여 있으면 여기선 안 그린다 — 바로 위 그룹 헤더에 같은 MAC 이 이미 있다.
+            //     둘 다 그리면 계기마다 같은 값이 두 번 나와 줄만 길어진다.
+            if (macShow && !macGrouped) {
+                const macBtn = `<button class="copy-btn" data-copy="${macShow}" title="모뎀MAC 복사" style="margin-left:2px;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>`;
+                subParts.push(`MAC <span class="mac-hl">${macShow}</span>${macBtn}`);
+            }
+        }
+        // 철거계기(교체 전) — 큰 글씨의 계기번호는 **신설계기**(지금 달려 있는 것)라,
+        //   대조하려면 철거 쪽도 보여야 한다. 합동은 자기 블록에서 이미 그리므로 뺀다.
+        if (meter.계기번호_전 && meter.category !== '합동') {
+            subParts.push(`철거계기 ${meter.계기번호_전}`);
+        }
+        if (meter.DCU장애여부 && meter.DCU장애여부 !== '정상') {
+            subParts.push(`<span style="color:#dc2626;font-weight:700;">DCU ${meter.DCU장애여부}</span>`);
+        }
+        if (meter.계기교체일) subParts.push(`교체일 ${meter.계기교체일}`);
+        // 6) SKT 전용 필드 (category=skt일 때 + 값 있을 때만)
+        if (meter.category === 'skt') {
+            if (meter.실효년월)        subParts.push(`실효 ${meter.실효년월}`);
+            if (meter.skt_작업결과)    subParts.push(`SKT결과 ${meter.skt_작업결과}`);
+            if (meter.skt_불가사유)    subParts.push(`SKT사유 ${meter.skt_불가사유}`);
+            if (meter.skt_kdn_작업일)  subParts.push(`KDN작업일 ${meter.skt_kdn_작업일}`);
+            if (meter.skt_kdn_이력)    subParts.push(`이력 ${meter.skt_kdn_이력}`);
+            if (meter.skt_비고)        subParts.push(`비고 ${meter.skt_비고}`);
+        }
+        // LP 수신 이력 — 표가 아니라 **한 줄 문장**이다(영준님 2026-08-21 "그냥 말로").
+        //   카테고리가 아니라 lp_이력 필드 유무로 건다 — 나중에 다른 리스트가 LP 를 싣고
+        //   들어와도 그대로 나온다. 실효·재방문·고압·합동은 필드가 없어 아무것도 안 그린다.
+        const lp = lpSummary(meter);
+        if (lp) subParts.push(lp.bad ? `<span style="color:#dc2626;">${lp.text}</span>` : lp.text);
+        // 6.4) 25미청구·미청구불가 — 원장·현장 기록 전 필드.
+        //   영준님 2026-09-20 "디테일에 다 넣어, 내가 빼란 것 빼고".
+        //   ★빼는 것은 둘뿐이다: 시공자 · DCU장애여부.
+        //   ★화면에 안 그리는 것 = 내부 메타뿐 — 각종 출처 필드·신뢰등급·대장출처·
+        //     주소_원문·lat·lng·좌표정확도. 추적용이라 데이터에는 남기고 화면에서만 뺀다.
+        //   ★블록 전체를 `대장출처` 로 거는 이유: 이 필드들(특히 지사·계약종별·검침방법)은
+        //     실효·합동·재방문에도 있어서 무조건 그리면 **모든 리스트의 화면이 바뀐다.**
+        //     `대장출처` 는 이 두 리스트에만 있는 필드라 그걸 리스트 표식으로 쓴다.
+        //     안쪽은 필드마다 값 유무로 건다 — 빈 필드는 줄만 길어지니 안 그린다.
+        //   ★라벨은 필드명 그대로. 판단 유도·경고 문구는 붙이지 않는다.
+        if (meter.대장출처) {
+            // 최종시공일 — 원본은 '20250822155556' 같은 14자리라 그대로는 못 읽는다.
+            //   ★표시만 끊어 준다. 저장값은 건드리지 않는다(michungguLp 와 같은 원칙).
+            const st = String(meter.최종시공일 || '').trim();
+            const stTxt = /^\d{14}$/.test(st)
+                ? `${st.slice(0, 4)}-${st.slice(4, 6)}-${st.slice(6, 8)} ${st.slice(8, 10)}:${st.slice(10, 12)}`
+                : (/^\d{8}$/.test(st) ? `${st.slice(0, 4)}-${st.slice(4, 6)}-${st.slice(6, 8)}` : st);
+            // ★지사는 그리지 않는다(영준님 2026-09-20) — 지도가 어차피 지사로 필터되니
+            //   디테일에서 다시 볼 이유가 없다. 데이터에는 남긴다(필터·통계가 쓴다).
+            //   ※고압철거 블록의 지사는 그대로 둔다 — 거기는 소재지 구와 어긋나는 개소
+            //     (지하철 등) 때문에 주소와 함께 읽히라고 넣은 것이다(2026-08-18).
+            if (stTxt) subParts.push(`최종시공일 ${stTxt}`);
+            [
+                // ★'공종'·'순번' 도 뺐다(영준님 2026-09-20). 공종은 전 건 '25년 보강' 아니면
+                //   빈값이라 볼 이유가 없고, 순번은 앱넘버와 같이 원장 안에서만 뜻이 있는 숫자다.
+                '구분', 'M/S', '집단', '485타입', '케이블', '커넥터',
+                '시설형태', '신호레벨', '추가계기', '비고1', '비고2', '앱변대주',
+                '계약종별', '검침방법',
+                // 불가 원장에만 있는 것들(영준님 2026-09-20 "불가에 들어갈 디테일도 다 넣어").
+                //   ★봉인은 빌더에서 미입력 표기(9999999·0000000)와 구분자를 이미 턴다.
+                //   ★0건인 칸(지도구분·철거구분·철거날짜 등)은 값이 없어 자연히 안 나온다.
+                // ★'앱넘버' 는 뺐다(영준님 2026-09-20 "뭘 뜻하는지 모르겠어") — 불가 원장에만
+                //   전건 있는 숫자(951·7820 등)인데 원장 안에서만 뜻이 있어 현장에 쓸모가 없다.
+                //   데이터에는 남긴다(원장 대조용).
+                '우선일자', '지도구분', '철거구분', '철거날짜',
+                '함체봉인1', '함체봉인2', '계기봉인1', '계기봉인2', '외부봉인1', '외부봉인2',
+                // ★원장이 적어 보낸 변대주 값 — 대장 값과 다를 때만 남는다(영준님 2026-09-20).
+                //   **상단에는 절대 올리지 않는다.** 상단은 대장, 여기는 원장 — 자리를 갈라 둬야
+                //   어느 쪽이 무엇인지 헷갈리지 않는다. 원천을 섞은 게 9/20 의 345건 사고였다.
+                '변대주번호_원장', '변대주_원장',
+            ].forEach(k => {
+                const v = String(meter[k] == null ? '' : meter[k]).trim();
+                if (v) subParts.push(`${k} ${v}`);
+            });
+        }
+
+        // 6.5) 25미청구 전용 — W(25대상). LP 7일치는 **줄이 아니라 표**로 따로 그린다
+        //   (영준님 2026-09-22). 표는 subParts 밑에 붙는다 — michungguLpTable 참고.
+        //   ★판단 유도는 하지 않는다(영준님 2026-09-20) — 값만 보여주고 배지·경고는 붙이지 않는다.
+        if (meter.W_25대상) subParts.push(`25대상 ${meter.W_25대상}`);
+
+        // 6.6) 불가사유 — 25년 미청구불가가 쓰는 값. 현장에서 '왜 못 했는지'가 곧 정보다.
+        //   ★카테고리가 아니라 **필드 유무로 건다**(michungguLp·lp_이력과 같은 방식) —
+        //     나중에 같은 필드를 쓰는 리스트가 들어와도 코드를 안 고치고 그대로 나온다.
+        //   ★판단 유도 문구는 붙이지 않는다(영준님 2026-09-20). 값만 보여준다.
+        //   상세가 없으면 사유만 찍는다(실측 5,694건 중 4건이 상세 없음).
+        if (meter.불가사유) {
+            const d = String(meter.불가상세 || '').trim();
+            subParts.push(`불가사유 ${meter.불가사유}${d ? ` / ${d}` : ''}`);
+        }
+
+        // 7) TOU 전용 필드 (category=tou일 때)
+        if (meter.category === 'tou') {
+            if (meter.재 || meter.tou_type === 'rework')
+                subParts.push('<span style="color:#dc2626;font-weight:700;">재</span>');
+            // 6/9 엑셀 디테일
+            if (meter.통신방식)         subParts.push(`${meter.통신방식}`);
+            if (meter.제조사 && meter.제조사 !== '제조사정보 없음') subParts.push(`${meter.제조사}`);
+            if (meter.통신사)           subParts.push(`${meter.통신사}`);
+            if (meter.차수)             subParts.push(`${meter.차수}`);
+            if (meter.AMI등록일자)      subParts.push(`등록 ${meter.AMI등록일자}`);
+            if (meter.LP수신)           subParts.push(`LP수신 ${meter.LP수신}`);
+            if (meter.조치구분)         subParts.push(`${meter.조치구분}`);
+            if (meter.수행주체)         subParts.push(`${meter.수행주체}`);
+            if (meter.보강순위)         subParts.push(`${meter.보강순위}`);
+            if (meter.모뎀MAC)          subParts.push(`MAC ${meter.모뎀MAC}`);
+            // 기존 TOU 필드(구버전 호환)
+            if (meter.tou_source)       subParts.push(`${meter.tou_source}`);
+            if (meter.LP != null && meter.LP !== '' && meter.LP !== '#N/A')
+                subParts.push(`LP ${meter.LP}`);
+            if (meter.시공일 && meter.시공일 !== '#N/A')
+                subParts.push(`시공일 ${meter.시공일}`);
+            // 한전 개통불가 / 앱 작업이력(박제)
+            if (meter.kepco_개통불가)
+                subParts.push(`<span style="color:#dc2626;">한전불가 ${meter.kepco_개통불가}</span>`);
+            if (meter.app_작업)
+                subParts.push(`앱작업 ${meter.app_작업}`);
+            if (meter.app_작업자)
+                subParts.push(`작업자 ${meter.app_작업자}`);
+        }
+        // 8) 재방문 전용 필드 (category=재방문): 완료했으나 LP 미수신 = 모뎀 재등록 필요
+        if (meter.category === '재방문') {
+            subParts.push('<span style="color:#dc2626;font-weight:700;">재방문·LP미수신</span>');
+            // 통신방식 옛→현 (교체하며 바뀐 경우 표시, 아니면 현재 방식만)
+            if (meter.통신방식_전 && meter.통신방식 && meter.통신방식_전 !== meter.통신방식)
+                subParts.push(`통신 ${meter.통신방식_전}→${meter.통신방식}`);
+            else if (meter.통신방식)
+                subParts.push(`통신 ${meter.통신방식}`);
+            // DCU·변대주는 위 1)에서 이미 찍는다 — 여기서 또 push 하면 재방문 개소만
+            //   같은 값이 두 번 나온다(전산화번호가 붙으면서 더 눈에 띄어 정리, 2026-08-12).
+        }
+        // 9) 고압철거 전용 필드 (category=고압): 철거할 모뎀 MAC + 현장 위치 비고
+        //   원본(주덕기 0810 리스트)에 DCUID·변대주가 통째로 비어 있어, 계기를 특정하는 값은
+        //   MAC 뿐이다. 비고는 "지하2층 전기실"처럼 계기를 찾아가는 위치 안내라 필수.
+        if (meter.category === '고압') {
+            // 한전기준 = 이 개소에 한전이 지시한 작업 성격(철거+재설치 / 철거).
+            //   마커 글자라벨('교'/'철')의 출처라 계기별 실제 값을 여기서 확인한다.
+            //   ※빈칸 건은 데이터셋에서 제외됐다(251 -> 168, apply_gapap_sheet2_fields.py).
+            if (meter.한전기준) {
+                subParts.push(`<span style="color:#dc2626;font-weight:700;">한전기준 ${meter.한전기준}</span>`);
+            }
+            if (meter.모뎀MAC) {
+                const macCopyBtn = `<button class="copy-btn" data-copy="${meter.모뎀MAC}" title="모뎀MAC 복사" style="margin-left:2px;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>`;
+                subParts.push(`MAC ${meter.모뎀MAC}${macCopyBtn}`);
+            }
+            // 지사 = 관할 지사(영준님 지시 2026-08-18). 소재지 구가 아니라 관리 주체라
+            //   지하철처럼 구와 어긋나는 개소가 있다(남양주 별내동 -> 동대문중랑지사).
+            //   그래서 주소 계열 바로 위에 붙여 함께 읽히게 둔다. 168건 전부 값이 있다.
+            if (meter.지사) subParts.push(`지사 ${meter.지사}`);
+            // 주소2 = 원천 엑셀의 개소명(예: '경춘선 갈매역'). 지번만으로 못 찾는 현장이라 싣는다.
+            if (meter.주소2) subParts.push(`주소2 ${meter.주소2}`);
+            // 비고1/비고2 는 원천의 두 칸을 그대로 가져온 것이고, 기존 `비고` 는 그 둘을
+            //   ' / ' 로 합친 값이다(하위호환으로 데이터에는 남겨 둔다). 화면에 둘 다 찍으면
+            //   같은 문장이 두 번 나오므로, 나뉜 값이 있으면 그쪽을 쓰고 없을 때만 합본을 쓴다.
+            if (meter.비고1 || meter.비고2) {
+                if (meter.비고1) subParts.push(`<span style="color:#2563eb;">비고1 ${meter.비고1}</span>`);
+                if (meter.비고2) subParts.push(`<span style="color:#2563eb;">비고2 ${meter.비고2}</span>`);
+            } else if (meter.비고 && meter.비고 !== '0') {   // 원천에 '0'만 든 칸이 1건 있다
+                subParts.push(`<span style="color:#2563eb;">${meter.비고}</span>`);
+            }
+        }
+        // 10) 합동시공 전용 필드 (category=합동): 다른 지역 계기팀이 계기만 갈고 간 개소.
+        //   원본(awms FMPMTR 연간대상 실효계기 목록)에 변대주·DCUID·통신방식·MAC 이 아예 없다.
+        //   그래서 현장에서 계기를 특정하는 값은 **철거계기번호**뿐이라 반드시 보여준다.
+        //   ★없는 값을 유추해 채우지 않았다(2026-08-12 DCUID 유사매칭 864건 오염 전례).
+        if (meter.category === '합동') {
+            subParts.push('<span style="color:#2563eb;font-weight:700;">합동시공·모뎀미시공</span>');
+            // 동호수 — 한 건물에 계기가 여럿인 개소(창동 657-109 는 7세대)에서 계기를 가르는
+            //   유일한 값이라 앞에 둔다. 원문 주소에서만 뽑을 수 있다(카카오는 층·호를 모른다).
+            if (meter.동호수) subParts.push(`<span style="font-weight:700;">동호수 ${meter.동호수}</span>`);
+            // 계기교체 날짜 — ★'작업일시'(awms 원본)를 먼저 쓴다.
+            //   '작업일' 은 지도 날짜 트리용 값이라 묶여 있을 수 있다. 소급 반영분은 여러 날에
+            //   걸쳐 한 일을 한 날짜로 모아 올리므로, 그걸 그리면 실제 작업일이 가려진다
+            //   (영준님 2026-08-26 "작업날짜 디테일에 쓰고"). 원본이 없으면 작업일로 떨어뜨린다.
+            const raw작업 = String(meter.작업일시 || '').slice(0, 10).replace(/-/g, '');
+            const d = raw작업 || String(meter.작업일 || '');
+            if (d) {
+                subParts.push(`계기교체 ${d.length === 8 ? `${d.slice(4, 6)}/${d.slice(6)}` : d}`);
+            }
+            if (meter.계기번호_전) subParts.push(`철거계기 ${meter.계기번호_전}`);
+            if (meter.업체) subParts.push(`${meter.업체}`);
+            if (meter.저압고압) subParts.push(`${meter.저압고압}`);
+            // 계약종별 — 데이터에는 전부터 실려 있었는데 화면에 그리는 곳이 없었다
+            //   (영준님 2026-09-10 "그대로 디테일에 넣어").
+            //   ★값은 가공하지 않는다 — awms 가 준 '100 주택용' 형식 그대로다.
+            //   ★합동에만 띄운다(영준님 정정). 실효도 이 칸을 갖고 있지만 원천이 한전 엑셀이라
+            //     '주택용전력' 처럼 명칭만 들어 있다. 형식이 다른 둘을 한 화면에 같은 이름으로
+            //     띄우면 같은 뜻인지 다른 뜻인지 읽는 사람이 가릴 수 없다.
+            if (meter.계약종별) subParts.push(`계약종별 ${meter.계약종별}`);
+            if (meter.계약전력) subParts.push(`계약 ${meter.계약전력}kW`);
+            if (meter.공사번호) subParts.push(`공사 ${meter.공사번호}`);
+        }
+        // 11) 광명지사 전용 필드 (category=광명, 다른 회사 리스트 — 2026-10-30).
+        //   원본(광명지사.xlsx)의 현장용 칸을 그대로 보여 준다. 빈 값은 안 그린다(474행은 일부 칸이 비어 온다).
+        //   ★값은 가공하지 않는다 — 원본 표기 그대로다.
+        if (meter.category === '광명') {
+            // 위치 출처 — 주소로 못 찾아 전주·장소 이름으로 옮긴 계기(빌더 relocate_approx). 주소는 원본 그대로다.
+            const src = String(meter.좌표출처 || '');
+            if (src) {
+                const POLE_LABEL = { 'pole_인입주': '인입주 기준', 'pole_변대주': '변대주 기준',
+                    'pole_인입주_근처': '인입주 기준(근처, 확인 필요)', 'pole_변대주_근처': '변대주 기준(근처, 확인 필요)' };
+                const t = src.startsWith('keyword:') ? `장소 검색 '${src.slice(8)}' 기준` : (POLE_LABEL[src] || src);
+                subParts.push(`<span style="color:#b45309;">위치: ${t.replace(/</g, '&lt;')}</span>`);
+            }
+            if (meter.계기위치) subParts.push(`<span style="font-weight:700;">계기위치 ${meter.계기위치}</span>`);
+            if (meter.DCU통신방식) subParts.push(`DCU 통신 ${meter.DCU통신방식}`);
+            if (meter.DCU기타ID) subParts.push(`DCU ${meter.DCU기타ID}`);
+            if (meter['M/S']) subParts.push(`M/S ${meter['M/S']}`);
+            if (meter.가공지중) subParts.push(meter.가공지중);
+            if (meter.계약종별) subParts.push(`계약종별 ${meter.계약종별}`);
+            if (meter.계약전력) subParts.push(`계약 ${meter.계약전력}kW`);
+            if (meter.제작소) subParts.push(`제작 ${meter.제작소}`);
+            if (meter.제조년월) subParts.push(`제조 ${meter.제조년월}`);
+            if (meter.부설일자) subParts.push(`부설 ${meter.부설일자}`);
+            if (meter.실효년월) subParts.push(`실효 ${meter.실효년월}`);
+            if (meter.LP취득여부) subParts.push(`LP취득 ${meter.LP취득여부}`);
+            if (meter.보강대상) subParts.push(`보강 ${meter.보강대상}`);
+        }
+        // 12) 선조치 — KDN 보강공사 추가분(category=선조치, 2026-10-30). 이미 모뎀이 시설된 곳의 재시공이다.
+        //   '기시설 — 교체로 작성' 안내는 공지(data/notices.json)로 한다 — 상세 고정 문구는 넣지 않는다(영준님 2026-10-30).
+        //   비고는 출입 방법·연락처·방문 약속이라 원문 전부 그대로 보여 준다(전화번호 포함, HTML 만 막는다).
+        if (meter.category === '선조치') {
+            const req = [meter.요청일 ? `요청일 ${meter.요청일}` : '', meter.요청상태 || ''].filter(Boolean).join(' ');
+            if (req) subParts.push(escHtml(req));
+            if (meter.변대주) subParts.push(`변대주명 ${escHtml(meter.변대주)}`);
+            if (meter.LP1 || meter.LP2) subParts.push(`LP1 ${escHtml(meter.LP1 || '-')} · LP2 ${escHtml(meter.LP2 || '-')}`);
+            if (meter.이전시공일) {
+                subParts.push(`이전 시공 ${escHtml(meter.이전시공일)} ${escHtml(meter.이전작업자 || '')} ${escHtml(meter.이전작업구분 || '')}`.trim());
+            }
+            if (meter.동호수) subParts.push(escHtml(meter.동호수));
+            if (meter.비고) subParts.push(`<span style="font-weight:700;">비고 ${escHtml(meter.비고)}</span>`);
+        }
+        const subDetails = subParts.length ? `<div class="meter-sub-details">${subParts.join(' · ')}</div>` : '';
+        // LP 7일치 표 — 값이 하나도 없으면 빈 문자열이라 아무것도 안 그린다.
+        const lpTable = michungguLpTable(meter);
+        const details = detailParts.join(', ');
+
+        // 계기번호 4구간 색상 분리
+        const no = meter.계기번호;
+        const s2 = no.slice(-2);
+        const isDup = dupGroupIndex[s2] !== undefined;
+        const noHtml = `<span class="meter-no-seg">` +
+            `<span class="seg-maker">${no.slice(0, 2)}</span>` +
+            `<span class="seg-type">${no.slice(2, 4)}</span>` +
+            `<span class="seg-mid">${no.slice(4, -2)}</span>` +
+            `<span class="${isDup ? 'seg-dup' : 'seg-last'}">${s2}</span>` +
+            `</span>`;
+
+        const copyBtn = `<button class="copy-btn" data-copy="${meter.계기번호}" title="계기번호 복사"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>`;
+
+        // 개별 불가 처리 상태
+        const isFailed = failedMeters[meter.계기번호] !== undefined;
+        const failReason = failedMeters[meter.계기번호] || '';
+        const failBtnClass = isFailed ? 'meter-fail-btn active' : 'meter-fail-btn';
+        const failBtnLabel = isFailed ? '불가해제' : '불가';
+        const failInputHtml = isFailed
+            ? `<div class="meter-fail-input-wrap">
+                 <input type="text" class="meter-fail-input"
+                        data-meter="${meter.계기번호}"
+                        placeholder="불가 사유 입력 후 엔터"
+                        value="${escHtml(failReason)}">
+               </div>`
+            : '';
+
+        // 추가된 계기 (admin이 + 계기 추가로 등록한 것)
+        const isAdded = !!meter.__added;
+        const addedMeta = meter.__added_meta || {};
+        const addedBadge = isAdded
+            ? `<span style="background:#ede9fe;color:#6d28d9;font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px;margin-right:6px;">추가</span>`
+            : '';
+        const addedRemoveBtn = (isAdded && isAdmin)
+            ? `<button class="meter-add-remove-btn" data-meter="${meter.계기번호}" title="추가 계기 삭제" style="margin-left:6px;background:#fee2e2;color:#b91c1c;border:none;border-radius:6px;padding:3px 8px;font-size:11px;font-weight:700;cursor:pointer;">삭제</button>`
+            : '';
+        const addedInfo = isAdded
+            ? `<div class="meter-sub-details" style="color:#7c3aed;">추가: ${escHtml(addedMeta.added_by_name || addedMeta.added_by || '?')}${addedMeta.mfg_ym ? ' · 제조 ' + escHtml(addedMeta.mfg_ym) : ''}</div>`
+            : '';
+
+        // 불가 처리된 계기는 취소선 클래스 추가
+        let itemClass = isFailed
+            ? `meter-item ${rowClass(s2)} meter-item-failed`
+            : `meter-item ${rowClass(s2)}`;
+        if (isAdded) itemClass += ' meter-item-added';
+
+        // ★계기번호가 빈 행(합동 임시저장분 등)은 체크·불가를 그리지 않는다 — 빈 키로 쓰면
+        //   'meterChecks/' 경로가 되어 그 주소의 체크·불가 전체를 덮는다(2026-10-19 감사).
+        const hasNo = !!String(meter.계기번호 || '').trim();
+        return `
+            <div class="${itemClass}">
+                ${hasNo ? `<input type="checkbox" class="meter-checkbox"
+                       data-meter="${meter.계기번호}" ${checked}>` : '<span style="display:inline-block;width:18px;"></span>'}
+                <div class="meter-info">
+                    ${addedBadge}<span class="meter-type">${parsedType}</span>
+                    ${noHtml}${copyBtn}${addedRemoveBtn}
+                    ${hasNo ? `<button class="${failBtnClass}" data-meter="${meter.계기번호}">${failBtnLabel}</button>` : '<span class="meter-sub-details" style="color:#9ca3af;">계기번호 없음</span>'}
+                    ${typeof recallBandHtml === 'function' ? recallBandHtml(meter.계기번호) : ''}
+                    ${details ? `<div class="meter-details">${details}</div>` : ''}
+                    ${subDetails}
+                    ${lpTable}
+                    ${addedInfo}
+                    ${failInputHtml}
+                </div>
+            </div>
+        `;
+    });
+    metersList.innerHTML = macGrouped
+        ? macGroupsHtml(filtered, meterCards, macKeyOf)
+        : meterCards.join('');
+
+    // 체크박스·복사·개별불가·장애 전체선택·추가계기 삭제·불가 사유 — 목록 컨테이너에 **한 번만** 위임한다.
+    //   ★전엔 그릴 때마다 setTimeout(100ms) 안에서 각 요소에 리스너를 붙였다. 100ms 안에 두 번
+    //     그리면(초기화 직후 등) 같은 요소에 리스너가 둘 붙어, 한 번 누르면 체크→해제가 연달아
+    //     저장됐다(2026-10-19 감사, 재현 확정). 위임은 innerHTML 을 몇 번 갈아도 1개다.
+    bindMetersListOnce(metersList);
+    setTimeout(() => {
+        // 계기 검색 — 입력 시 목록으로 자동 스크롤
+        const searchInput = document.getElementById('meter-search');
+        if (searchInput) {
+            searchInput.oninput = () => {
+                renderMetersList();
+                setTimeout(() => {
+                    const actionsEl = document.querySelector('.overlay-actions');
+                    if (actionsEl) actionsEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }, 150);
+            };
+        }
+    }, 100);
+}
+
+// 정렬 버튼 토글 — 같은 버튼을 다시 누르면 원래 순서(none)로 복귀
+function toggleSort(mode) {
+    currentSortMode = (currentSortMode === mode) ? 'none' : mode;
+    updateSortBtnUI();
+    renderMetersList();
+}
+
+// 정렬 버튼 활성화 UI 업데이트
+function updateSortBtnUI() {
+    const dupBtn = document.getElementById('sort-btn-dup');
+    const makerBtn = document.getElementById('sort-btn-maker');
+    if (!dupBtn || !makerBtn) return;
+    dupBtn.classList.toggle('active', currentSortMode === 'dup');
+    makerBtn.classList.toggle('active', currentSortMode === 'maker');
+}
+
+// 상세 패널 닫기
+function closeDetail() {
+    flushMeterFailReasons();   // 입력 중이던 불가 사유를 닫기 전에 보낸다
+    document.getElementById('fullpage-overlay').classList.remove('active');
+}
+
+// 주소의 작업 상태 업데이트 후 마커 색상 갱신
+function updateStatus(state) {
+    const session = authGetSession();
+    const reason = (document.getElementById('fail-reason')?.value || '').trim();
+    // 방금 상태와 함께 보낸 사유 — 칸에서 포커스가 빠질 때 같은 값을 또 보내지 않게 기준값을 맞춘다
+    { const fi = document.getElementById('fail-reason'); if (fi) fi.dataset.orig = reason; }
+    // 합친 마커(같은 좌표 = 한 건물)는 완료/불가/보류를 구성 키 전부에 기록.
+    //   ※ #2 결정점(영준님 확인 사안): 한 건물 한 번 작업 = 묶인 지번 다 처리.
+    //   ★전파 범위는 '이 마커'로 한정된다. 같은 지번이라도 좌표가 갈려 다른 마커면
+    //     상태 키가 다르므로(js/status-key.js) 그쪽까지 완료로 넘어가지 않는다.
+    const targets = (currentStatusKeys && currentStatusKeys.length) ? currentStatusKeys : [currentStatusKey];
+    targets.forEach(addr => {
+        saveStateEvent(
+            addr,
+            state,
+            // ★보류도 사유를 싣는다(영준님 2026-09-10 "보류 시에도 사유 남길 수 있게").
+            //   전에는 불가만 실어서, 보류로 찍으면 왜 보류인지가 기록에 남지 않았고
+            //   불가 -> 보류로 바꾸면 이미 적어 둔 사유까지 빈 문자열로 덮였다.
+            //   완료·초기화는 종전대로 사유를 비운다(그 상태에는 사유가 없다).
+            (state === 'fail' || state === 'hold') ? reason : '',
+            session ? session.id   : '',
+            session ? session.name : ''
+        );
+    });
+    updateMarkerColor(currentStatusKey);
+}
+
+// 주소의 작업 상태 초기화 (pending으로 되돌리기) — 체크박스는 유지
+function resetStatus() {
+    if (!workStatus[currentStatusKey]) return;
+
+    // ★되돌린 사람을 기록한다(영준님 2026-08-18: "초기화 이력은 지도에 표시 X. 우리 이력에만 남게").
+    //   전엔 빈 문자열을 넘겨 updatedBy/updatedByName 이 덮여, 누가 되돌렸는지 추적이 안 됐다
+    //   (2026-08-18 중계동505 2건·진관동 88 1건이 그래서 미상으로 남음).
+    //   지도에는 안 나온다 — 표시부가 이미 pending 을 거른다:
+    //     updateWorkerInfo() 는 state==='pending' 이면 숨김 / map.js 는 updatedByName 을 안 읽음
+    //     / stats.html 은 pending 을 집계에서 continue.
+    const session = authGetSession();
+
+    // state만 pending으로 (체크박스/불가 유지) — 합친 마커는 구성 지번 전부
+    const targets = (currentStatusKeys && currentStatusKeys.length) ? currentStatusKeys : [currentStatusKey];
+    targets.forEach(addr => {
+        if (workStatus[addr]) {
+            saveStateEvent(addr, 'pending', '',
+                session ? session.id   : '',
+                session ? session.name : '');
+        }
+    });
+
+    updateMarkerColor(currentStatusKey);
+    showDetail(currentAddress, currentMeters, currentAddresses, currentStatusKeys);
+}
+
+// 계기 체크 토글
+function toggleMeterCheck(meterNumber) {
+    if (!String(meterNumber || '').trim()) { console.warn('[check] 빈 계기번호 — 저장 거부'); return; }
+    if (!workStatus[currentStatusKey]) {
+        workStatus[currentStatusKey] = { state: 'pending', checkedMeters: [], reason: '' };
+    }
+    const checkedMeters = workStatus[currentStatusKey].checkedMeters || [];
+    const isChecked = checkedMeters.includes(meterNumber);
+    saveCheckEvent(currentStatusKey, meterNumber, !isChecked);
+}
+
+// ── 계기 추가 모달 (admin 전용) ───────────────────────────────
+function openAddMeterModal() {
+    if (!currentAddress) return;
+    document.getElementById('add-meter-addr').textContent = currentAddress;
+    document.getElementById('add-meter-input').value = '';
+    document.getElementById('add-meter-toast').style.display = 'none';
+    document.getElementById('add-meter-overlay').style.display = 'flex';
+    // 알파벳 보조 버튼 핸들러 (한 번만 바인딩되도록 매번 재할당)
+    document.querySelectorAll('.add-meter-alpha-btn').forEach(btn => {
+        btn.onclick = () => {
+            const inp = document.getElementById('add-meter-input');
+            const ch = btn.dataset.ch;
+            if (ch === 'BS') {
+                inp.value = inp.value.slice(0, -1);
+            } else if (inp.value.length < 11) {
+                inp.value = inp.value + ch;
+            }
+            inp.focus();
+        };
+    });
+    setTimeout(() => document.getElementById('add-meter-input').focus(), 100);
+}
+
+function closeAddMeterModal() {
+    document.getElementById('add-meter-overlay').style.display = 'none';
+}
+
+function showAddMeterToast(msg) {
+    const t = document.getElementById('add-meter-toast');
+    t.textContent = msg;
+    t.style.display = 'block';
+}
+
+// QR 스캐너 호출 — 종로앱과 동일한 QrScanner 모듈
+function openAddMeterQr() {
+    if (typeof QrScanner === 'undefined') {
+        return showAddMeterToast('QR 스캐너 로드 실패');
+    }
+    QrScanner.show((text /*, photoBlob */) => {
+        const raw = String(text || '');
+        // 신형 QR 포맷: "PID:127825 YYMM:24.11 MID:07530057365"
+        const midMatch = raw.match(/MID\s*[:：]?\s*([A-Za-z0-9]+)/i);
+        let meterId = '';
+        if (midMatch) {
+            meterId = String(midMatch[1]).toUpperCase();
+            if (meterId.length > 11) meterId = meterId.slice(0, 11);
+        } else {
+            // 구형 폴백
+            const cleaned = raw.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+            meterId = cleaned.length >= 11 ? cleaned.slice(0, 11) : cleaned;
+        }
+        document.getElementById('add-meter-input').value = meterId;
+    });
+}
+
+async function saveNewMeter() {
+    const input = document.getElementById('add-meter-input');
+    const meterId = (input.value || '').trim().toUpperCase();
+
+    if (!meterId || meterId.length !== 11) {
+        return showAddMeterToast('계기번호 11자리 확인');
+    }
+    // 중복 체크 (기존 + 추가)
+    const allMeters = getMetersWithAdded();
+    if (allMeters.some(m => m.계기번호 === meterId)) {
+        return showAddMeterToast('이미 등록된 계기번호');
+    }
+
+    try {
+        await saveAddedMeter(currentStatusKey, meterId, {});
+        closeAddMeterModal();
+        renderMetersList();
+        if (typeof updateMarkerColor === 'function') updateMarkerColor(currentStatusKey);
+    } catch (e) {
+        showAddMeterToast('저장 실패: ' + e.message);
+    }
+}
+
+// ── awms수집 연동: 이 주소 계기풀을 collect_handoff에 write → 아미큐 앱 딥링크 ──
+async function collectToAmiqueue(address, meters) {
+    if (!Array.isArray(meters) || !meters.length) { alert('이 주소에 계기가 없습니다.'); return; }
+    if (typeof db === 'undefined' || !db) { alert('Firebase 미연결'); return; }
+    // 아미큐 수집에 필요한 필드만 추려 가볍게 전달
+    const slim = meters.map(m => ({
+        계기번호: String(m.계기번호 || ''),
+        계기타입: m.계기타입 || '',
+        통신방식: m.통신방식 || '',
+        지사: m.지사 || '',
+        변대주: m.변대주 || '',
+        DCUID: m.DCUID || '',
+        주소: m.주소 || address,
+        도로명주소: m.도로명주소 || '',
+    })).filter(m => m.계기번호);
+    if (!slim.length) { alert('계기번호 있는 계기가 없습니다.'); return; }
+    const key = 'h' + Date.now().toString(36);
+    try {
+        await db.ref('collect_handoff/' + key).set({
+            addr: address,
+            jisa: slim[0].지사 || '',
+            meters: slim,
+            ts: Date.now(),
+            by: (typeof currentUser !== 'undefined' && currentUser) ? currentUser : '',
+        });
+    } catch (e) { alert('연동 데이터 저장 실패: ' + e.message); return; }
+    // 아미큐 앱 딥링크 (폰에서만 동작; 미설치/데스크톱이면 안내)
+    const intentUrl = 'intent://collect?key=' + key
+        + '#Intent;scheme=amiqueue;package=com.youngjun.amiqueue;S.key=' + key + ';end';
+    const t0 = Date.now();
+    try { window.location.href = intentUrl; } catch (e) {}
+    setTimeout(() => {
+        if (Date.now() - t0 < 2500) {
+            alert('아미큐 앱이 열리지 않았습니다.\n폰에서 아미큐 설치 후 다시 시도하거나,\n아미큐 [수집] 버튼에 key를 입력하세요:\n\n' + key);
+        }
+    }, 1500);
+}
+
+
+// 장애 트리 — MAC 하나를 헤더 + 계기 목록으로 그린다.
+//   MAC 속성: 기술타입·변대주·작업일·작업자·연결장치·개통여부 (영준님 지시).
+//   ★DCUID 는 awms 값을 쓰지 않는다 — awms DCU_ID 는 `변대주+64/6` 이라 한전 대장과 체계가 다르다.
+//     여기 실린 DCUID/변대주명은 계기번호로 우리 데이터에서 찾아온 진짜 값이다.
+// idx = 이 주소에서 몇 번째 MAC 인지(0-based), tot = 그 주소의 MAC 개수.
+//   MAC 은 12자리라 통째로는 눈이 안 따라간다 — **뒤 2자리**를 크게 띄우고,
+//   MAC 이 둘 이상이면 그룹마다 색을 달리해 현장에서 헷갈리지 않게 한다.
+function jangaeTreeHtml(g, idx = 0, tot = 1, checkedList = []) {
+    const esc = v => String(v == null ? '' : v);
+    const mac = String(g.모뎀MAC || '');
+    const COPY = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
+    const head = [];
+    if (g.기술타입) head.push(`<b>${esc(g.기술타입)}</b>`);
+    if (g.변대주명) head.push(`변대주 ${esc(g.변대주명)}`);
+    else if (g.변대주) head.push(`변대주 ${esc(g.변대주)}`);
+    if (g.DCUID) head.push(`DCU ${esc(g.DCUID)}`);
+    if (g.작업일) head.push(`작업 ${esc(g.작업일).slice(5)}`);
+    const worker = [g.작업자1, g.작업자2].filter(Boolean).join('·');
+    if (worker) head.push(esc(worker));
+    if (g.외장형연결장치) head.push(`연결장치 ${esc(g.외장형연결장치)}`);
+
+    // 계기번호 뒤 2자리 중복 — 한 개소에 같은 끝자리가 여럿이면 현장에서 헷갈린다.
+    //   실효 모달의 dup-row-N 과 같은 체계를 쓴다(영준님 2026-09-02 "계기에 해놔야지").
+    const sufCount = {};
+    (g.계기목록 || []).forEach(m => {
+        const t = String(m.계기번호 || '').slice(-2);
+        if (t) sufCount[t] = (sufCount[t] || 0) + 1;
+    });
+    const dupIdx = {};
+    let di = 0;
+    Object.keys(sufCount).sort().forEach(t => { if (sufCount[t] > 1) dupIdx[t] = di++; });
+
+    const rows = (g.계기목록 || []).map(m => {
+        const bad = !!m.장애;
+        const no = String(m.계기번호 || '');
+        const suf = no.slice(-2);
+        const isDup = dupIdx[suf] !== undefined;
+        const dupCls = isDup ? ` dup-row-${dupIdx[suf] % 10}` : '';
+        // 계기번호 4구간 색상 — 실효 모달과 **같은 체계**를 그대로 쓴다(영준님 2026-09-02).
+        //   메이커2 / 타입코드2 / 중간 / 끝2(중복이면 seg-dup 빨강)
+        const noHtml = `<span class="meter-no-seg">`
+            + `<span class="seg-maker">${esc(no.slice(0, 2))}</span>`
+            + `<span class="seg-type">${esc(no.slice(2, 4))}</span>`
+            + `<span class="seg-mid">${esc(no.slice(4, -2))}</span>`
+            + `<span class="${isDup ? 'seg-dup' : 'seg-last'}">${esc(suf)}</span>`
+            + `</span>`;
+        const st = m.상태 === '실패' ? '실패' : (m.상태 === '성공' ? '성공' : (m.상태 || '미판정'));
+        const stColor = m.상태 === '성공' ? '#16a34a' : (m.상태 === '실패' ? '#dc2626' : '#9ca3af');
+        // 주택명·호수 — 한 건물에 계기가 여럿인 개소에서 계기를 가르는 유일한 값이라
+        //   계기번호 옆에 크게 둔다(영준님 지시). 장애 시트엔 없어 계기번호로 우리 데이터에서
+        //   끌어왔다 — 2,837건 중 1,489건(52%) 채워졌고 나머지는 원천에 없다.
+        const ho = String(m.공동주택명 || '').trim();
+        const hoHtml = ho ? `<span class="jangae-ho">${esc(ho)}</span>` : '';
+        const sub = [];
+        if (m.상호) sub.push(`상호 ${esc(m.상호)}`);
+        if (m.모뎀유형) sub.push(esc(m.모뎀유형));
+        if (m.계기타입) sub.push(esc(m.계기타입));
+        if (m.시설유형) sub.push(esc(m.시설유형));
+        if (m.작업구분) sub.push(esc(m.작업구분));
+        if (m.분기기) sub.push(`분기 ${esc(m.분기기)}`);
+        if (m.LP) sub.push(`LP ${esc(m.LP)}`);
+        return `
+            <div class="jangae-meter${bad ? ' jangae-bad' : ''}${dupCls}">
+                <input type="checkbox" class="meter-checkbox" data-meter="${esc(no)}"${checkedList.includes(no) ? ' checked' : ''}>
+                ${noHtml}
+                <button class="copy-btn" data-copy="${esc(m.계기번호)}" title="계기번호 복사">${COPY}</button>
+                ${hoHtml}
+                <span style="color:${stColor};font-weight:700;margin-left:4px;">${st}</span>
+                ${typeof recallBandHtml === 'function' ? recallBandHtml(no) : ''}
+                <div class="jangae-meter-sub">${sub.join(' · ')}</div>
+            </div>`;
+    }).join('');
+
+    return `
+        <div class="jangae-group">
+            <div class="jangae-head">
+                <span class="jangae-mac">${esc(mac)}</span>
+                <button class="copy-btn" data-copy="${esc(mac)}" title="모뎀MAC 복사">${COPY}</button>
+                ${tot > 1 ? `<span class="jangae-seq c${idx % 6}">MAC ${idx + 1}/${tot}</span>` : ''}
+                <button class="jangae-all" data-macall="${esc(mac)}">전체선택</button>
+                <span class="jangae-count">장애 ${g.장애수 || 0}/${g.계기수 || 0}</span>
+                <div class="jangae-head-sub">${head.join(' · ')}</div>
+            </div>
+            ${rows}
+        </div>`;
+}

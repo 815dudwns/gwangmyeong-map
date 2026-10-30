@@ -1,0 +1,131 @@
+/* login.css — 로그인 페이지 전용 스타일 */
+
+/* 로그인 페이지는 overflow 허용 (common.css 덮어쓰기) */
+body.login-page {
+    overflow: auto;
+    background: #ffffff;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+/* 지도 영역이 로그인 페이지에서 보이지 않도록 */
+body.login-page #map {
+    display: none;
+}
+
+/* 전체 컨테이너 */
+.login-container {
+    width: 100%;
+    max-width: 380px;
+    padding: 24px 16px;
+}
+
+/* 카드 */
+/* 카드 상자 없이 흰 화면에 글자 로고 하나 (2026-10-30 단순화) */
+.login-card {
+    background: #ffffff;
+    padding: 36px 12px 32px;
+}
+
+/* 헤더 영역 */
+.login-header {
+    text-align: center;
+    margin-bottom: 36px;
+}
+
+.login-title {
+    font-size: 28px;
+    font-weight: 800;
+    color: #111827;
+    letter-spacing: -0.6px;
+}
+
+.login-title span {
+    color: #0C9266;
+}
+
+/* 폼 */
+.login-form {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.form-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.form-group label {
+    font-size: 13px;
+    font-weight: 600;
+    color: #374151;
+}
+
+.form-group input {
+    height: 50px;
+    padding: 0 14px;
+    border: 1px solid #d1d5db;
+    border-radius: 10px;
+    font-size: 16px;
+    font-family: inherit;
+    color: #111827;
+    background: #fafafa;
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    -webkit-appearance: none;
+}
+
+.form-group input:focus {
+    border-color: #0C9266;
+    background: #fff;
+    box-shadow: 0 0 0 3px rgba(12, 146, 102, 0.12);
+}
+
+/* 에러 메시지 */
+.error-msg {
+    min-height: 18px;
+    font-size: 13px;
+    color: #ef4444;
+    text-align: center;
+    font-weight: 500;
+}
+
+/* 로그인 버튼 */
+.login-btn {
+    margin-top: 4px;
+    height: 52px;
+    padding: 0;
+    background: #0C9266;
+    color: #fff;
+    border: none;
+    border-radius: 10px;
+    font-size: 16px;
+    font-weight: 700;
+    font-family: inherit;
+    cursor: pointer;
+    transition: background 0.15s, opacity 0.15s;
+    letter-spacing: 0.3px;
+}
+
+.login-btn:hover:not(:disabled) {
+    background: #0a7a55;
+}
+
+.login-btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+
+/* 모바일 최적화 */
+@media (max-width: 400px) {
+    .login-card {
+        padding: 28px 8px 24px;
+    }
+    .login-title {
+        font-size: 26px;
+    }
+}

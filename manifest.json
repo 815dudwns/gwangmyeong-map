@@ -1,0 +1,17 @@
+{
+  "name": "광명 작업지도",
+  "short_name": "광명맵",
+  "description": "광명지사 작업지도(보기 전용)",
+  "start_url": "/gwangmyeong-map/index.html",
+  "scope": "/gwangmyeong-map/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0C9266",
+  "theme_color": "#0C9266",
+  "lang": "ko",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

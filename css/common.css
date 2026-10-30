@@ -1,0 +1,266 @@
+/* common.css — 공통/기본 스타일 */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Malgun Gothic', sans-serif; overflow: hidden; }
+#map { width: 100%; height: 100vh; }
+
+.toast { position: fixed; bottom: 60px; left: 50%; transform: translateX(-50%); background: rgba(17,24,39,0.85); color: white; padding: 8px 18px; border-radius: 20px; font-size: 13px; pointer-events: none; opacity: 0; transition: opacity 0.2s; z-index: 9999; white-space: nowrap; }
+.toast.show { opacity: 1; }
+
+/* 동기화 진행 알약 — 상단 중앙. 좌우 상단은 메뉴/검색 버튼이 쓰므로 가운데를 쓴다.
+   토스트와 같은 시각 언어(반투명 짙은 알약, 13px)로 톤을 맞춘다. 아이콘 없음. */
+.sync-pill {
+    position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
+    background: rgba(17,24,39,0.85); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+    color: white; padding: 7px 16px; border-radius: 20px; font-size: 13px;
+    pointer-events: none; z-index: 700; white-space: nowrap;
+    opacity: 0; transition: opacity 0.25s;
+}
+.sync-pill.show { opacity: 1; }
+@media (max-width: 640px) { .sync-pill { top: 8px; font-size: 12px; padding: 6px 14px; } }
+
+.loc-btn { position: fixed; bottom: 16px; right: 16px; z-index: 500; width: 40px; height: 40px; border-radius: 50%; border: none; background: white; box-shadow: 0 2px 6px rgba(0,0,0,0.3); cursor: pointer; font-size: 18px; display: flex; align-items: center; justify-content: center; }
+.loc-btn.active { background: #3b82f6; color: white; }
+
+/* 사용자 정보 + 로그아웃 바 — 지도 우상단에 반투명으로 표시 */
+.user-bar { position: fixed; top: 10px; right: 10px; z-index: 500; display: flex; align-items: center; gap: 6px; background: rgba(17,24,39,0.55); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); color: rgba(255,255,255,0.9); padding: 5px 10px; border-radius: 20px; font-size: 12px; line-height: 1; }
+.user-bar .user-name { font-weight: 500; letter-spacing: 0.01em; }
+.user-bar .user-divider { opacity: 0.45; }
+.user-bar .logout-btn { background: none; border: none; color: rgba(255,255,255,0.75); font-size: 12px; cursor: pointer; padding: 0; line-height: 1; }
+.user-bar .logout-btn:hover { color: #fff; text-decoration: underline; }
+.user-bar .search-btn { background: none; border: none; color: rgba(255,255,255,0.9); font-size: 12px; cursor: pointer; padding: 0; line-height: 1; font-weight: 600; }
+.user-bar .search-btn:hover { color: #fff; text-decoration: underline; }
+/* 모바일: 터치 영역 확보 */
+@media (max-width: 640px) { .user-bar { top: 8px; right: 8px; padding: 6px 12px; font-size: 13px; } .user-bar .logout-btn, .user-bar .search-btn { font-size: 13px; min-height: 28px; } }
+
+/* 검색 모달 — 오버레이 */
+.search-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 2000; display: none; align-items: flex-start; justify-content: center; padding: 60px 16px 16px; }
+.search-overlay.active { display: flex; }
+.search-modal { background: white; border-radius: 12px; width: 100%; max-width: 520px; max-height: calc(100vh - 80px); display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
+.search-header { padding: 12px 16px; border-bottom: 1px solid #e5e7eb; display: flex; align-items: center; justify-content: space-between; background: #f9fafb; flex-shrink: 0; }
+.search-header h3 { font-size: 16px; font-weight: 700; color: #111827; margin: 0; }
+.search-header .close-btn { width: 32px; height: 32px; border: none; background: #e5e7eb; border-radius: 6px; cursor: pointer; font-size: 20px; line-height: 1; color: #374151; font-weight: 600; }
+.search-input-row { padding: 12px 16px; display: flex; gap: 6px; border-bottom: 1px solid #e5e7eb; flex-shrink: 0; }
+.search-input-row input { flex: 1; min-width: 0; padding: 10px 12px; border: 2px solid #e5e7eb; border-radius: 8px; font-size: 14px; }
+.search-input-row input:focus { outline: none; border-color: #3b82f6; }
+.search-go-btn { padding: 10px 16px; background: #1d4ed8; color: white; border: none; border-radius: 8px; font-size: 13px; font-weight: 700; cursor: pointer; white-space: nowrap; }
+.search-hint { padding: 8px 16px; font-size: 12px; color: #6b7280; background: #f9fafb; border-bottom: 1px solid #e5e7eb; flex-shrink: 0; }
+.search-results { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; min-height: 100px; }
+.search-result-row { padding: 11px 16px; border-bottom: 1px solid #f3f4f6; cursor: pointer; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.search-result-row:hover, .search-result-row:active { background: #eff6ff; }
+.sr-target { font-weight: 700; color: #111827; font-size: 14px; font-variant-numeric: tabular-nums; word-break: break-all; }
+.sr-cond { font-size: 12px; color: #6b7280; }
+.sr-cond.cat-skt { color: #6d28d9; font-weight: 700; }
+.sr-cond.cat-real { color: #047857; font-weight: 700; }
+.search-empty { padding: 24px 16px; text-align: center; color: #9ca3af; font-size: 13px; }
+.search-result-row { padding: 12px 16px; }
+.search-result-row .sr-main { flex: 1; min-width: 0; }
+.search-result-row .sr-primary { font-size: 14px; font-weight: 700; color: #111827; word-break: break-all; line-height: 1.35; }
+.search-result-row .sr-secondary { font-size: 12px; color: #6b7280; margin-top: 2px; line-height: 1.35; word-break: break-all; }
+.search-result-row .sr-meta { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+
+/* 검색 결과 임시 마커 — 현재위치 점과 동일 형태, 빨강 + 펄스 */
+.search-pulse { width: 14px; height: 14px; background: #ef4444; border: 2px solid white; border-radius: 50%; box-shadow: 0 0 0 4px rgba(239,68,68,0.28); animation: search-pulse 1s infinite; }
+@keyframes search-pulse {
+    0%, 100% { box-shadow: 0 0 0 4px rgba(239,68,68,0.28); }
+    50%      { box-shadow: 0 0 0 10px rgba(239,68,68,0.10); }
+}
+
+/* 지사 필터 드롭다운 — 지도 좌상단 */
+.jisa-filter { position: fixed; top: 10px; left: 10px; z-index: 500; }
+.jisa-filter select { background: rgba(17,24,39,0.85); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); color: #fff; border: none; padding: 7px 28px 7px 12px; border-radius: 20px; font-size: 13px; font-family: inherit; cursor: pointer; appearance: none; -webkit-appearance: none; background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='white' d='M0 0l5 6 5-6z'/></svg>"); background-repeat: no-repeat; background-position: right 10px center; box-shadow: 0 2px 6px rgba(0,0,0,0.2); }
+.jisa-filter select:focus { outline: 2px solid #3b82f6; }
+@media (max-width: 640px) { .jisa-filter { top: 8px; left: 8px; } .jisa-filter select { font-size: 14px; padding: 8px 30px 8px 14px; } }
+
+/* 구 체크박스 패널 — 지사 드롭다운 바로 아래 */
+.gu-filter { margin-top: 6px; background: rgba(17,24,39,0.82); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); border-radius: 10px; padding: 6px 10px; display: flex; flex-direction: column; gap: 2px; min-width: 100px; }
+.gu-filter label { display: flex; align-items: center; gap: 6px; color: #fff; font-size: 13px; font-family: inherit; cursor: pointer; padding: 3px 0; white-space: nowrap; }
+.gu-filter input[type="checkbox"] { width: 14px; height: 14px; accent-color: #60a5fa; cursor: pointer; flex-shrink: 0; }
+@media (max-width: 640px) { .gu-filter { padding: 6px 12px; } .gu-filter label { font-size: 14px; } }
+
+/* 카테고리 필터 — 토글 버튼 + 드롭다운 패널 (구 체크박스 높이만큼 아래로 이동) */
+.category-filter { position: fixed; top: 130px; left: 10px; z-index: 500; }
+.category-toggle {
+    padding: 8px 14px;
+    background: #1e3a8a;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.category-panel {
+    display: none;
+    margin-top: 6px;
+    background: white;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 10px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+    min-width: 110px;
+}
+.category-panel.open { display: block; }
+.category-panel label {
+    display: flex;
+    align-items: center;
+    padding: 6px 4px;
+    font-size: 13px;
+    cursor: pointer;
+    gap: 8px;
+    white-space: nowrap;
+}
+.category-panel input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    accent-color: #10b981;
+    cursor: pointer;
+}
+/* 날짜 트리 — 합동시공처럼 매일 쌓이는 데이터셋의 자식 체크박스.
+   날짜가 늘어나도 패널이 화면 밖으로 자라지 않게 높이를 묶고 스크롤을 준다. */
+.category-panel .date-subtree {
+    margin: -2px 0 4px 18px;
+    padding-left: 8px;
+    border-left: 2px solid #e5e7eb;
+    max-height: 150px;
+    overflow-y: auto;
+}
+.category-panel .date-subtree label { padding: 3px 4px; font-size: 12px; color: #4b5563; }
+.category-panel .date-subtree input[type="checkbox"] { width: 14px; height: 14px; }
+
+@media (max-width: 640px) { .category-filter { top: 50px; left: 8px; } .category-toggle { font-size: 14px; padding: 8px 14px; } }
+
+/* ===== 좌상단 메뉴 트리거 버튼 ===== */
+.menu-trigger {
+    position: fixed; top: 10px; left: 10px; z-index: 600;
+    width: 40px; height: 40px;
+    background: rgba(17,24,39,0.85); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+    border: none; border-radius: 10px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+}
+.menu-trigger svg { width: 22px; height: 22px; }
+@media (max-width: 640px) { .menu-trigger { top: 8px; left: 8px; } }
+
+/* 우상단 독립 검색 버튼 (메뉴 밖) */
+.search-trigger {
+    position: fixed; top: 10px; right: 10px; z-index: 600;
+    width: 40px; height: 40px;
+    background: rgba(17,24,39,0.85); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+    border: none; border-radius: 10px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+}
+.search-trigger svg { width: 20px; height: 20px; }
+@media (max-width: 640px) { .search-trigger { top: 8px; right: 8px; } }
+
+/* ===== 앱 메뉴 오버레이 + 패널 ===== */
+.app-menu-overlay {
+    position: fixed; inset: 0; z-index: 1400;
+    background: rgba(0,0,0,0.35);
+    display: none;
+}
+.app-menu-overlay.open { display: block; }
+
+.app-menu {
+    position: fixed; top: 0; left: 0; z-index: 1500;
+    width: 300px; max-width: 88vw; height: 100%;
+    background: #fff;
+    box-shadow: 4px 0 20px rgba(0,0,0,0.18);
+    padding: 20px 16px calc(20px + env(safe-area-inset-bottom));
+    display: none; flex-direction: column; gap: 4px;
+    overflow-y: auto; -webkit-overflow-scrolling: touch;
+}
+.app-menu.open { display: flex; }
+
+/* 헤더: 이름 + 닫기 */
+.am-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding-bottom: 14px;
+}
+.am-name { font-size: 16px; font-weight: 800; color: #111827; }
+.am-x {
+    background: none; border: none; font-size: 24px; color: #6b7280;
+    cursor: pointer; line-height: 1; padding: 0 2px;
+}
+
+/* 구분선 */
+.am-sep { height: 1px; background: #e5e7eb; margin: 6px 0; }
+
+/* 섹션 라벨 */
+.am-section-label {
+    font-size: 11px; font-weight: 800; color: #6b7280;
+    letter-spacing: .04em; text-transform: uppercase;
+    padding: 10px 8px 4px;
+}
+
+/* 공통 행: 아이콘 + 텍스트 */
+.am-row {
+    display: flex; align-items: center; gap: 12px; width: 100%;
+    padding: 11px 8px; background: none; border: none;
+    border-radius: 10px; font-family: inherit;
+    font-size: 14px; font-weight: 700; color: #111827;
+    cursor: pointer; text-decoration: none; text-align: left;
+}
+.am-row:active { background: #f3f4f6; }
+.am-ico { width: 20px; height: 20px; flex-shrink: 0; color: #1d4ed8; display: flex; align-items: center; justify-content: center; }
+.am-ico svg { width: 20px; height: 20px; }
+.am-txt { flex: 1; }
+.am-go { width: 16px; height: 16px; color: #9ca3af; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
+.am-go svg { width: 16px; height: 16px; }
+
+/* 로그아웃 행 */
+.am-logout { color: #dc2626; }
+.am-logout .am-ico { color: #dc2626; }
+
+/* 링크 행 */
+a.am-row { color: #111827; }
+
+/* 메뉴 안에서 jisa-filter, category-filter, user-bar의 fixed 포지셔닝 해제 */
+.app-menu .jisa-filter {
+    position: static;
+    top: auto; left: auto;
+    padding: 4px 0;
+}
+.app-menu .jisa-filter select {
+    width: 100%;
+    background: rgba(17,24,39,0.85); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+    color: #fff; border: none;
+    padding: 9px 28px 9px 12px; border-radius: 8px;
+    font-size: 14px; font-family: inherit; cursor: pointer;
+    appearance: none; -webkit-appearance: none;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='white' d='M0 0l5 6 5-6z'/></svg>");
+    background-repeat: no-repeat; background-position: right 10px center;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+}
+
+.app-menu .gu-filter {
+    margin-top: 6px;
+    background: rgba(17,24,39,0.82); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+    border-radius: 10px; padding: 8px 12px;
+    display: flex; flex-direction: column; gap: 2px;
+}
+.app-menu .gu-filter label {
+    color: #fff; font-size: 14px; cursor: pointer; padding: 3px 0;
+    display: flex; align-items: center; gap: 6px; white-space: nowrap;
+}
+
+.app-menu .category-filter {
+    position: static;
+    top: auto; left: auto;
+    padding: 4px 0;
+}
+/* 메뉴 안에서 카테고리 토글버튼: 전체 너비 */
+.app-menu .category-filter .category-toggle {
+    width: 100%;
+    text-align: left;
+    border-radius: 8px;
+}
+/* 메뉴 안에서 카테고리 패널: 인셋 스타일 */
+.app-menu .category-filter .category-panel {
+    margin-top: 4px;
+    border-radius: 8px;
+}
+
+/* user-bar를 메뉴 안에 배치할 때 fixed 해제 (display:none으로 원본 숨기고 메뉴 안에는 별도 구성) */
+.app-menu .am-hidden-links { display: none; }
